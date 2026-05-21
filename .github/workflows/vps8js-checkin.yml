@@ -1,0 +1,26 @@
+name: VPS8 自动签到
+
+on:
+  schedule:
+    - cron: "0 1 * * *"  # 每天 UTC 1点（北京时间 9点）运行
+  workflow_dispatch:     # 允许手动触发
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 执行签到
+        env:
+          VPS8_COOKIES: ${{ vars.VPS8_COOKIES }}
+          VPS8_BASE_URL: "https://vps8.zz.cd"
+        run: node vps8-checkin/checkin.js
