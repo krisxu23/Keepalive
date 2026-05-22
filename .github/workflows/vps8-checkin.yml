@@ -2,7 +2,7 @@ name: VPS8 Checkin
 
 on:
   schedule:
-    - cron: '14 0 * * *'
+    - cron: '2 0 * * *'
   workflow_dispatch:
     inputs:
       debug:
@@ -142,7 +142,7 @@ jobs:
           
           # 替换新cron
           TARGET="- cron:"
-          REPLACEMENT="- cron: '$new_cron'"
+          REPLACEMENT="- cron: '2 0 * * *'"
           sed -i -E "s/$TARGET '.+'/$REPLACEMENT/" "$yaml_file"
           
           # 提交推送
