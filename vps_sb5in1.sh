@@ -1039,7 +1039,7 @@ get_quick_tunnel() {
     ArgoDomain=$get_argodomain
 }
 
-# 更新Argo域名到订阅
+# 更新Argo域名节点
 change_argo_domain() {
     content=$(cat "$client_dir")
     vmess_url=$(grep -o 'vmess://[^ ]*' "$client_dir")
@@ -1493,7 +1493,7 @@ proto_exists() {
     jq -e --arg tag "$tag" '.inbounds[] | select(.tag == $tag)' "${conf_dir}/inbounds.json" > /dev/null 2>&1
 }
 
-# 更新订阅文件
+# 更新节点链接，根据 tag 删除对应的链接行
 remove_url_by_tag() {
     local tag="$1"
     sed -i '/'^${tag}':\/\//d' "$client_dir"
@@ -1562,7 +1562,7 @@ add_socks5_inbound() {
         | awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' \
         | sed 's/ /_/g' || echo "Socks5")
 
-    local url_line="socks://${sk_user}:${sk_pass}@${server_ip}:${sk_port}#${isp}"
+    local url_line="socks5://${sk_user}:${sk_pass}@${server_ip}:${sk_port}#${isp}"
 
     echo "" >> "${client_dir}"
     echo "${url_line}" >> "${client_dir}"
@@ -1913,7 +1913,7 @@ case "$1" in
         echo ""
         green "  -i, --install     无交互安装sing-box"
         green "  -c, --check       查看节点信息"
-        green "  -r, --restart     重新获取argo临时隧道并更新到订阅"
+        green "  -r, --restart     重新获取argo临时隧道并更新到节点"
         green "  -u, --uninstall   无交互卸载sing-box"
         green "  -h, --help        显示此帮助信息"
         echo ""
