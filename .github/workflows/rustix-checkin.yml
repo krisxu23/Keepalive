@@ -18,8 +18,8 @@ concurrency:
 
 jobs:
   rustix-alive:
-    # workflow_dispatch 始终执行；repository_dispatch 仅 status 含 Down 时执行
-    if: github.event_name != 'repository_dispatch' || contains(github.event.client_payload.status, 'Down')
+    # workflow_dispatch 始终执行；repository_dispatch 仅 status 含 down 时执行
+    if: github.event_name != 'repository_dispatch' || contains(github.event.client_payload.status, 'down')
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
