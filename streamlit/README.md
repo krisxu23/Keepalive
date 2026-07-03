@@ -6,7 +6,7 @@ STREAMLIT_APP_URL=https://python-xray-argo-yutian81.streamlit.app
 ```
 
 ### http_code
-```
+```bash
 curl -s -o /dev/null -w "%{http_code}\n" https://cfargo-domain/
 ```
 return: 400 - OK!
@@ -18,7 +18,7 @@ https://api.github.com/repos/yutian81/Keepalive/dispatches
 ```
 
 - header
-```
+```json
 {
   "Authorization": "Bearer <pat token>",
   "Accept": "application/vnd.github+json"
@@ -26,7 +26,7 @@ https://api.github.com/repos/yutian81/Keepalive/dispatches
 ```
 
 - body
-```
+```json
 {
   "event_type": "streamlit",
   "client_payload": {
