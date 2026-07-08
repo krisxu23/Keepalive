@@ -8,6 +8,9 @@ on:
 jobs:
   checkin:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./iamhc
     permissions:
       contents: read
     
@@ -22,12 +25,10 @@ jobs:
           cache: pip
 
       - name: 📦 安装依赖
-        working-directory: ./iamhc
         run: pip install -r requirements.txt
 
       - name: ✅ 执行签到
         id: checkin
-        working-directory: ./iamhc
         env:
           IAMHC_BASE_URL: ${{ vars.IAMHC_BASE_URL }}
           IAMHC_USER_ID: ${{ vars.IAMHC_USER_ID }}
@@ -40,7 +41,6 @@ jobs:
 
       - name: 💾 将 session 写回 GitHub Actions Variables
         if: always()
-        working-directory: ./iamhc
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
