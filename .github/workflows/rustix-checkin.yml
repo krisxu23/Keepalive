@@ -50,6 +50,8 @@ jobs:
           ACCOUNTS: ${{ secrets.RUSTIX_ACCOUNTS }}
           # 【新增】从 GitHub Secrets 读取 Cookie JSON 字符串
           RUSTIX_COOKIE: ${{ secrets.RUSTIX_COOKIE }}
+          # 服务器ID，用于拼接控制台页面地址
+          RUSTIX_SERVERID: ${{ secrets.RUSTIX_SERVERID }}
           # Telegram 通知（可选，未配置 Secret 则不推送）
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
