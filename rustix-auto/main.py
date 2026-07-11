@@ -85,26 +85,18 @@ def load_accounts():
 
 
 def load_cookies_for_account(email: str) -> list:
-    """从环境变量 RUSTIX_COOKIE 中解析当前账号的 Cookie 列表。
-    
-    支持格式：
-    1. 单个账号的 JSON 数组: [{"name": "...", "value": "..."}, ...]
-    2. 多账号映射字典: {"user1@email.com": [{"name": "..."}, ...], "user2@email.com": [...]}
-    """
+    """从环境变量 RUSTIX_COOKIE 中解析当前账号的 Cookie 列表。"""
     cookie_env = os.environ.get("RUSTIX_COOKIE", "").strip()
     if not cookie_env:
         return []
     try:
         data = json.loads(cookie_env)
-        # 格式 1：多账号字典映射
         if isinstance(data, dict) and email in data:
             logger.info(f"成功匹配到账号 {email} 的专属 Cookie 配置")
             return data[email]
-        # 格式 2：单个账号的 Cookie 数组
         if isinstance(data, list):
             logger.info(f"载入通用/单账号 Cookie 配置")
             return data
-        # 格式 3：单个 Cookie 字典字典
         if isinstance(data, dict) and "name" in data:
             logger.info(f"载入单条 Cookie 配置")
             return [data]
@@ -146,22 +138,40 @@ def find_first_visible(page: Page, selectors):
     return None, None
 
 
-def find_button_by_text(page: Page, texts):
-    """通过按钮文本查找按钮，texts 为候选文本列表（不区分大小写）。"""
-    for text in texts:
-        for sel in [
-            f'button:has-text("{text}")',
-            f'a:has-text("{text}")',
-            f'[role="button"]:has-text("{text}")',
-            f'input[type="submit"][value*="{text}" i]',
-            f'input[type="button"][value*="{text}" i]',
-        ]:
-            try:
-                loc = page.locator(sel).first
-                if loc.count() > 0 and loc.is_visible():
-                    return loc, sel, text
-            except Exception:
-                continue
+def find_button_by_text_robust(page: Page, target_texts: list):
+    """
+    鲁棒地遍历页面按钮和链接元素。
+    通过提取 innerText/textContent，净化空白字符后进行不区分大小写的子串匹配，
+    从而解决 SVG 嵌套、类名混淆或多余空格导致的定位失败问题。
+    """
+    # 优先尝试 get_by_role (Playwright 原生推荐)
+    for text in target_texts:
+        try:
+            loc = page.get_by_role("button").filter(has_text=text).first
+            if loc.count() > 0 and loc.is_visible():
+                return loc, f"button_role_{text}", text
+            loc_a = page.get_by_role("link").filter(has_text=text).first
+            if loc_a.count() > 0 and loc_a.is_visible():
+                return loc_a, f"link_role_{text}", text
+        except Exception:
+            continue
+
+    # 兜底方案：广度遍历可疑按钮元素
+    try:
+        elements = page.locator('button, a, [role="button"], input[type="button"], input[type="submit"]')
+        count = elements.count()
+        for i in range(count):
+            el = elements.nth(i)
+            text_content = el.text_content() or ""
+            # 清理文本中的换行、制表符及首尾空格
+            text_content_clean = " ".join(text_content.split()).lower()
+            for target in target_texts:
+                if target.lower() in text_content_clean:
+                    if el.is_visible():
+                        return el, f"custom_locator_{i}", target
+    except Exception as e:
+        logger.warning(f"遍历页面寻找按钮时出错: {e}")
+
     return None, None, None
 
 
@@ -175,14 +185,14 @@ def do_login(page: Page, email: str, password: str) -> bool:
 
     page.wait_for_timeout(LOGIN_PAGE_WAIT)
 
-    # 用户名/邮箱输入框（实测：type="text" name="username"）
+    # 用户名/邮箱输入框
     email_loc, email_sel = find_first_visible(page, [
         'input[name="username"]',
         'input[type="email"]',
         'input[name="email"]',
         'input[autocomplete="username"]',
     ])
-    # 密码输入框（实测：type="password" name="password"）
+    # 密码输入框
     pwd_loc, pwd_sel = find_first_visible(page, [
         'input[type="password"]',
         'input[name="password"]',
@@ -191,7 +201,7 @@ def do_login(page: Page, email: str, password: str) -> bool:
 
     if not email_loc or not pwd_loc:
         page.screenshot(path=f"debug_login_{int(time.time())}.png")
-        logger.error("未找到登录表单（邮箱/密码输入框）")
+        logger.error("未找到登录表单")
         return False
 
     logger.info(f"填写账号: {email}")
@@ -199,8 +209,8 @@ def do_login(page: Page, email: str, password: str) -> bool:
     pwd_loc.fill(password)
     page.wait_for_timeout(500)
 
-    # 登录按钮（实测：button[type="submit"] 文本 "Войти"）
-    login_btn, login_sel, txt = find_button_by_text(page, [
+    # 登录按钮
+    login_btn, login_sel, txt = find_button_by_text_robust(page, [
         "Войти",          # 俄语
         "Login",          # 英语
         "Sign in",
@@ -223,14 +233,12 @@ def do_login(page: Page, email: str, password: str) -> bool:
     except Exception:
         login_btn.first.click(force=True)
 
-    # 等待跳转/加载
     try:
-        page.wait_for_load_state("networkidle", timeout=30000)
+        page.wait_for_load_state("domcontentloaded", timeout=30000)
     except PWTimeout:
-        logger.warning("登录后 networkidle 超时，继续流程")
+        pass
     page.wait_for_timeout(STEP_WAIT)
 
-    # 检测是否登录成功（仍在 login 页则失败）
     if "/auth/login" in page.url:
         body = (page.inner_text("body") or "")[:500].lower()
         if any(k in body for k in ["incorrect", "invalid", "неверн", "ошибк"]):
@@ -248,10 +256,10 @@ def click_manage_server(page: Page) -> bool:
     logger.info("寻找 Manage Server 按钮")
     page.wait_for_timeout(STEP_WAIT)
 
-    manage, sel, txt = find_button_by_text(page, [
+    manage, sel, txt = find_button_by_text_robust(page, [
         "Manage Server",
         "Manage",
-        "Управление",      # 俄语：管理
+        "Управление",      # 俄语
         "Управлять сервером",
     ])
     if not manage:
@@ -273,12 +281,12 @@ def click_manage_server(page: Page) -> bool:
     except Exception:
         manage.first.click(force=True)
 
+    # 关键修改：避免使用 networkidle (防 WebSocket 挂起等待 30 秒)
     try:
-        page.wait_for_load_state("networkidle", timeout=30000)
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
     except PWTimeout:
         pass
-    # SPA 渲染控制台页面需要更长时间
-    page.wait_for_timeout(6000)
+    page.wait_for_timeout(3000)
     return True
 
 
@@ -287,21 +295,31 @@ def start_server(page: Page, console_lines: list) -> str:
     """
     返回状态字符串：
       - "started"  成功启动并验证
-      - "online"   服务器已在线（start 不可点击）
+      - "online"   服务器已在线（无需操作）
       - "offline"  服务器离线且启动失败
       - "no_start" 未找到 start 按钮
     """
     logger.info("寻找 start 按钮")
-    page.wait_for_timeout(STEP_WAIT)
 
-    # 显式等待 start 按钮出现（SPA 渲染）
+    # 1. 显式等待控制台页面关键状态渲染 (DOM 文本监控)
+    logger.info("等待控制台页面关键状态渲染...")
     try:
-        page.wait_for_selector('button:has-text("Start")', timeout=15000)
-    except PWTimeout:
-        pass
+        page.wait_for_function(
+            """() => {
+                const text = document.body.innerText || "";
+                return text.includes("Start") || text.includes("Stop") || 
+                       text.includes("Online") || text.includes("Offline") ||
+                       text.includes("Запустить") || text.includes("Остановить") ||
+                       text.includes("Запущен") || text.includes("Выключен");
+            }""",
+            timeout=20000
+        )
+        logger.info("控制台状态渲染成功")
+    except Exception as e:
+        logger.warning(f"等待页面状态渲染超时，继续尝试匹配: {e}")
 
-    # 重新查找
-    start_btn, sel, txt = find_button_by_text(page, [
+    # 2. 寻找 Start 按钮
+    start_btn, sel, txt = find_button_by_text_robust(page, [
         "Start",
         "Запустить",
         "Power On",
@@ -312,55 +330,78 @@ def start_server(page: Page, console_lines: list) -> str:
         logger.error("未找到 start 按钮")
         return "no_start"
 
+    # 3. 检查 start 按钮是否可点击
     clickable = is_clickable(start_btn)
     logger.info(f"start 按钮可点击状态: {clickable}")
 
+    # 4. 如果 start 按钮不可点击 (disabled)
     if not clickable:
-        logger.info("start 按钮不可点击 -> 服务器可能已在线，跳过启动")
-        if check_stop_button(page) == "clickable":
-            logger.info("stop 按钮可点击，服务器确实在线")
-        return "online"
+        logger.info("start 按钮不可点击 -> 检查服务器是否已经是在线状态...")
+        page_text = page.locator("body").text_content() or ""
+        # 判断页面是否含有 "Online" 或 "Online" 俄语
+        is_online_text = "online" in page_text.lower() or "запущен" in page_text.lower()
+        stop_status = check_stop_button(page)
 
-    # start 可点击 -> 服务器离线，点击启动
-    logger.info("服务器离线，点击 start 启动")
+        if is_online_text or stop_status == "clickable":
+            logger.info("确认：页面文本显示为 Online 或 stop 按钮可点击。服务器已在线，无需启动。")
+            return "online"
+        else:
+            logger.warning("虽然 start 按钮不可点击，但没有检测到明确的 Online 状态，可能正在初始化中。")
+            return "online"
+
+    # 5. 如果 start 按钮可点击，代表离线，点击启动
+    logger.info("服务器目前处于离线状态，点击 start 启动")
     try:
         start_btn.click()
     except Exception:
         start_btn.first.click(force=True)
 
-    # 等待控制台输出 "Running Done!"
-    logger.info(f"等待控制台输出 'Running Done!'（最长 {START_WAIT_TIMEOUT}s）")
+    # 6. 循环等待直到上线
+    logger.info(f"等待服务器上线中（最长 {START_WAIT_TIMEOUT}s）")
     deadline = time.time() + START_WAIT_TIMEOUT
     detected = False
     while time.time() < deadline:
+        # 检查控制台日志捕获
         if any("Running Done!" in line for line in console_lines):
             detected = True
             break
+        # 检查页面是否出现了 Running Done! 文本
         try:
             if page.locator(":text('Running Done!')").count() > 0:
                 detected = True
                 break
         except Exception:
             pass
+        # 检查页面整体状态是否已变更为 Online
+        try:
+            current_text = page.locator("body").text_content() or ""
+            if "online" in current_text.lower() or "запущен" in current_text.lower():
+                logger.info("检测到页面状态已成功变更为 Online")
+                detected = True
+                break
+        except Exception:
+            pass
+
         page.wait_for_timeout(2000)
 
     if detected:
-        logger.info("已检测到 'Running Done!'，服务器上线中")
+        logger.info("服务器已成功上线")
     else:
-        logger.warning("等待超时，未检测到 'Running Done!'，继续验证 stop 状态")
+        logger.warning("等待超时，未能捕获上线特征，进行最终 stop 按钮状态验证")
 
-    # 通过 stop 按钮状态验证（不点击 stop）
+    # 7. 最终状态验证
     page.wait_for_timeout(STEP_WAIT)
     if check_stop_button(page) == "clickable":
-        logger.info("验证成功：stop 按钮可点击，服务器已上线")
+        logger.info("验证成功：stop 按钮可点击，服务器已在线运行")
         return "started"
+    
     logger.warning("验证未通过：stop 按钮不可点击")
     return "offline"
 
 
 def check_stop_button(page: Page) -> str:
     """返回 'clickable' / 'exists_not_clickable' / 'not_found'。"""
-    stop_btn, sel, txt = find_button_by_text(page, [
+    stop_btn, sel, txt = find_button_by_text_robust(page, [
         "Stop",            # 英语
         "Остановить",      # 俄语
         "Power Off",
@@ -368,19 +409,11 @@ def check_stop_button(page: Page) -> str:
         "Shutdown",
     ])
     if not stop_btn:
-        stop_btn, sel = find_first_visible(page, [
-            'button:has-text("Stop")',
-            'button:has-text("Остановить")',
-            '[role="button"]:has-text("Stop")',
-            'input[value="Stop" i]',
-        ])
-
-    if not stop_btn:
         logger.info("未找到 stop 按钮")
         return "not_found"
 
     clickable = is_clickable(stop_btn)
-    logger.info(f"stop 按钮可点击状态: {clickable} (不点击)")
+    logger.info(f"stop 按钮可点击状态: {clickable} (不进行点击)")
     return "clickable" if clickable else "exists_not_clickable"
 
 
@@ -431,7 +464,6 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
         if cookies:
             logger.info("检测到 RUSTIX_COOKIE 配置，尝试通过 Cookie 导入登录...")
             try:
-                # 规范化 Cookie 域名格式，确保 Playwright 正常注入
                 for c in cookies:
                     if "domain" not in c:
                         c["domain"] = "my.rustix.me"
@@ -441,26 +473,25 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
                 page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
                 page.wait_for_timeout(STEP_WAIT)
 
-                # 验证登录是否成功：没有被反向重定向到登录页，且页面中能检测到管理按钮
+                # 验证登录状态：是否被重定向到 /auth/login 且能匹配到 Manage 按钮
                 if "/auth/login" not in page.url:
-                    manage, _, _ = find_button_by_text(page, ["Manage Server", "Manage", "Управление"])
+                    manage, _, _ = find_button_by_text_robust(page, ["Manage Server", "Manage", "Управление"])
                     if manage:
                         logger.info("Cookie 验证成功！已直接登录。")
                         cookie_login_success = True
                     else:
-                        # 额外等待 SPA 渐进渲染，再重试一次按钮检测
                         page.wait_for_timeout(STEP_WAIT)
-                        manage, _, _ = find_button_by_text(page, ["Manage Server", "Manage", "Управление"])
+                        manage, _, _ = find_button_by_text_robust(page, ["Manage Server", "Manage", "Управление"])
                         if manage:
                             logger.info("Cookie 验证成功！已直接登录。")
                             cookie_login_success = True
 
                 if not cookie_login_success:
-                    logger.warning("Cookie 登录验证未通过（未能发现管理选项或被重定向至登录页）。")
+                    logger.warning("Cookie 登录验证未通过。")
             except Exception as e:
                 logger.warning(f"使用 Cookie 登录时出现异常，将切换密码登录: {e}")
 
-        # 2. 如果 Cookie 登录失败或未配置 Cookie，降级使用密码登录
+        # 2. 账号密码登录兜底
         if not cookie_login_success:
             logger.info("尝试使用传统账号密码方式登录...")
             if not do_login(page, email, password):
@@ -527,7 +558,6 @@ def main():
             ok += 1
     logger.info(f"成功 {ok}/{len(results)}")
 
-    # 推送汇总通知
     if notify.tg_enabled():
         notify.notify_summary(results)
 
