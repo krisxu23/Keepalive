@@ -6,8 +6,8 @@ Rustix 服务器自动启动脚本
 - 优先支持 Cookie 登录 (RUSTIX_COOKIE)，失效或未配置时自动降级至账号密码登录
 - 自动登录 https://my.rustix.me/auth/login
 - 点击 Manage Server -> 判断 start 按钮状态 -> 启动服务器
-- 监听浏览器控制台 "Running Done!" 确认上线
-- 通过 stop 按钮可点击状态验证（不点击 stop）
+- 支持 Telegram 多节点实事网页截图发送，方便排查假登录与状态异常
+- 强力校验控制台前端路由跳转
 
 站点语言：俄语 / 英语（不支持中文）
 """
@@ -20,6 +20,7 @@ import logging
 import argparse
 from datetime import datetime
 
+import requests
 from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout
 
 import notify
@@ -44,6 +45,34 @@ START_WAIT_TIMEOUT = 120
 STEP_WAIT = 3000
 # 登录页 SPA 渐进渲染等待（ms）
 LOGIN_PAGE_WAIT = 6000
+
+
+# ---------------- Telegram 截图发送接口 ----------------
+def send_telegram_photo(photo_path: str, caption: str = "") -> bool:
+    """直接调用 Telegram Bot API 发送实时截图，方便远程排查。"""
+    token = os.environ.get("TG_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TG_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        logger.info("未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过发送 TG 截图")
+        return False
+    if not os.path.exists(photo_path):
+        logger.warning(f"未找到截图文件: {photo_path}")
+        return False
+        
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    try:
+        with open(photo_path, 'rb') as photo:
+            files = {'photo': photo}
+            data = {'chat_id': chat_id, 'caption': caption}
+            response = requests.post(url, data=data, files=files, timeout=15)
+            if response.status_code == 200:
+                logger.info(f"成功发送 Telegram 截图验证: {photo_path}")
+                return True
+            else:
+                logger.warning(f"发送 TG 截图失败，状态码: {response.status_code}, 响应: {response.text}")
+    except Exception as e:
+        logger.warning(f"发送 TG 截图时出现网络异常: {e}")
+    return False
 
 
 # ---------------- 账号与 Cookie 加载 ----------------
@@ -144,7 +173,6 @@ def find_button_by_text_robust(page: Page, target_texts: list):
     通过提取 innerText/textContent，净化空白字符后进行不区分大小写的子串匹配，
     从而解决 SVG 嵌套、类名混淆或多余空格导致的定位失败问题。
     """
-    # 优先尝试 get_by_role (Playwright 原生推荐)
     for text in target_texts:
         try:
             loc = page.get_by_role("button").filter(has_text=text).first
@@ -156,14 +184,12 @@ def find_button_by_text_robust(page: Page, target_texts: list):
         except Exception:
             continue
 
-    # 兜底方案：广度遍历可疑按钮元素
     try:
         elements = page.locator('button, a, [role="button"], input[type="button"], input[type="submit"]')
         count = elements.count()
         for i in range(count):
             el = elements.nth(i)
             text_content = el.text_content() or ""
-            # 清理文本中的换行、制表符及首尾空格
             text_content_clean = " ".join(text_content.split()).lower()
             for target in target_texts:
                 if target.lower() in text_content_clean:
@@ -200,7 +226,8 @@ def do_login(page: Page, email: str, password: str) -> bool:
     ])
 
     if not email_loc or not pwd_loc:
-        page.screenshot(path=f"debug_login_{int(time.time())}.png")
+        page.screenshot(path="debug_login_form_error.png")
+        send_telegram_photo("debug_login_form_error.png", f"❌ 账号 {email} 未能加载到登录表单")
         logger.error("未找到登录表单")
         return False
 
@@ -223,7 +250,8 @@ def do_login(page: Page, email: str, password: str) -> bool:
         txt = "submit(fallback)"
 
     if not login_btn:
-        page.screenshot(path=f"debug_login_{int(time.time())}.png")
+        page.screenshot(path="debug_login_btn_error.png")
+        send_telegram_photo("debug_login_btn_error.png", f"❌ 账号 {email} 未找到登录按钮")
         logger.error("未找到登录按钮")
         return False
 
@@ -271,7 +299,8 @@ def click_manage_server(page: Page) -> bool:
         txt = "Manage(fallback)"
 
     if not manage:
-        page.screenshot(path=f"debug_dashboard_{int(time.time())}.png")
+        page.screenshot(path="debug_no_manage_btn.png")
+        send_telegram_photo("debug_no_manage_btn.png", "❌ 登录成功后，但在控制面板主页未找到 'Manage Server' 按钮")
         logger.error("未找到 Manage Server 按钮")
         return False
 
@@ -281,17 +310,20 @@ def click_manage_server(page: Page) -> bool:
     except Exception:
         manage.first.click(force=True)
 
-    # 关键修改：避免使用 networkidle (防 WebSocket 挂起等待 30 秒)
+    # 强校验：使用 lambda 表达式监控 URL 的改变，只有确认包含 /server/ 且包含 /console 路由才算跳转成功
+    logger.info("等待 URL 强切到控制台页面...")
     try:
-        page.wait_for_load_state("domcontentloaded", timeout=15000)
-    except PWTimeout:
-        pass
+        page.wait_for_url(lambda url: "/server/" in url and "/console" in url, timeout=15000)
+        logger.info(f"路由跳转成功，当前真实 URL: {page.url}")
+    except Exception as e:
+        logger.warning(f"等待 URL 路由重定向超时，当前 URL: {page.url}。将继续流程...")
+
     page.wait_for_timeout(3000)
     return True
 
 
 # ---------------- 启动服务器流程 ----------------
-def start_server(page: Page, console_lines: list) -> str:
+def start_server(page: Page, console_lines: list, email: str) -> str:
     """
     返回状态字符串：
       - "started"  成功启动并验证
@@ -301,7 +333,7 @@ def start_server(page: Page, console_lines: list) -> str:
     """
     logger.info("寻找 start 按钮")
 
-    # 1. 显式等待控制台页面关键状态渲染 (DOM 文本监控)
+    # 1. 监控真正的控制台页面渲染
     logger.info("等待控制台页面关键状态渲染...")
     try:
         page.wait_for_function(
@@ -326,7 +358,8 @@ def start_server(page: Page, console_lines: list) -> str:
         "Boot",
     ])
     if not start_btn:
-        page.screenshot(path=f"debug_start_{int(time.time())}.png")
+        page.screenshot(path="debug_no_start_btn.png")
+        send_telegram_photo("debug_no_start_btn.png", f"⚠️ 账号 {email} 在控制台页面未找到 Start 按钮 (已拍照，请排查)")
         logger.error("未找到 start 按钮")
         return "no_start"
 
@@ -338,15 +371,18 @@ def start_server(page: Page, console_lines: list) -> str:
     if not clickable:
         logger.info("start 按钮不可点击 -> 检查服务器是否已经是在线状态...")
         page_text = page.locator("body").text_content() or ""
-        # 判断页面是否含有 "Online" 或 "Online" 俄语
         is_online_text = "online" in page_text.lower() or "запущен" in page_text.lower()
         stop_status = check_stop_button(page)
 
         if is_online_text or stop_status == "clickable":
-            logger.info("确认：页面文本显示为 Online 或 stop 按钮可点击。服务器已在线，无需启动。")
+            logger.info("确认：服务器已在线，无需启动。拍摄在线截图...")
+            page.screenshot(path="server_status_online.png")
+            send_telegram_photo("server_status_online.png", f"ℹ️ 账号 {email} 的服务器已经处于 Online (在线状态)，无需再启动。")
             return "online"
         else:
-            logger.warning("虽然 start 按钮不可点击，但没有检测到明确的 Online 状态，可能正在初始化中。")
+            logger.warning("虽然 start 按钮不可点击，但没有检测到明确的 Online 状态。")
+            page.screenshot(path="server_status_unknown.png")
+            send_telegram_photo("server_status_unknown.png", f"❓ 账号 {email} 的 Start 按钮不可点击，但页面未显示在线状态，请核实。")
             return "online"
 
     # 5. 如果 start 按钮可点击，代表离线，点击启动
@@ -361,18 +397,15 @@ def start_server(page: Page, console_lines: list) -> str:
     deadline = time.time() + START_WAIT_TIMEOUT
     detected = False
     while time.time() < deadline:
-        # 检查控制台日志捕获
         if any("Running Done!" in line for line in console_lines):
             detected = True
             break
-        # 检查页面是否出现了 Running Done! 文本
         try:
             if page.locator(":text('Running Done!')").count() > 0:
                 detected = True
                 break
         except Exception:
             pass
-        # 检查页面整体状态是否已变更为 Online
         try:
             current_text = page.locator("body").text_content() or ""
             if "online" in current_text.lower() or "запущен" in current_text.lower():
@@ -392,10 +425,14 @@ def start_server(page: Page, console_lines: list) -> str:
     # 7. 最终状态验证
     page.wait_for_timeout(STEP_WAIT)
     if check_stop_button(page) == "clickable":
-        logger.info("验证成功：stop 按钮可点击，服务器已在线运行")
+        logger.info("验证成功：stop 按钮可点击，服务器已在线运行。发送喜报截图...")
+        page.screenshot(path="server_start_success.png")
+        send_telegram_photo("server_start_success.png", f"🚀 账号 {email} 的服务器已成功激活启动并验证上线！")
         return "started"
     
     logger.warning("验证未通过：stop 按钮不可点击")
+    page.screenshot(path="server_start_failed.png")
+    send_telegram_photo("server_start_failed.png", f"❌ 账号 {email} 的服务器离线，且点击 Start 启动后验证失败，仍处于 Offline。")
     return "offline"
 
 
@@ -495,8 +532,15 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
         if not cookie_login_success:
             logger.info("尝试使用传统账号密码方式登录...")
             if not do_login(page, email, password):
+                page.screenshot(path="login_failed.png")
+                send_telegram_photo("login_failed.png", f"❌ 账号 {email} 登录失败（Cookie 和密码均失效）")
                 result["error"] = "登录失败（Cookie 和 密码均尝试完毕）"
                 return result
+
+        # 拍摄登录成功后的控制台主页，并推送到 Telegram
+        logger.info("已成功登录主面板！正在截取主页面验证...")
+        page.screenshot(path="dashboard_success.png")
+        send_telegram_photo("dashboard_success.png", f"🔓 账号 {email} 登录主面板验证成功！正在切换到控制台...")
 
         # 3. 点击 Manage Server
         if not click_manage_server(page):
@@ -504,7 +548,7 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
             return result
 
         # 4. 启动服务器并验证
-        status = start_server(page, console_lines)
+        status = start_server(page, console_lines, email)
         result["status"] = status
         result["ok"] = status in ("started", "online")
         return result
