@@ -25,6 +25,7 @@ from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout
 
 import notify
 
+# ---------------- 日志配置 ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -38,13 +39,19 @@ logger = logging.getLogger("rustix-auto")
 
 LOGIN_URL = "https://my.rustix.me/auth/login"
 HOME_URL = "https://my.rustix.me"
-START_WAIT_TIMEOUT = 120
+# 启动后等待服务器上线的最长时间（秒）— 5分钟
+START_WAIT_TIMEOUT = 300
+# 各步骤通用等待（ms）
 STEP_WAIT = 3000
+# 登录页 SPA 渐进渲染等待（ms）
 LOGIN_PAGE_WAIT = 6000
+# 服务器列表卡片渲染等待（ms）
 DASHBOARD_LOAD_WAIT = 15000
+# 控制台页面加载等待（ms）
 CONSOLE_LOAD_WAIT = 15000
 
 
+# ---------------- GitHub Secret 更新 ----------------
 def get_server_console_url() -> str:
     server_id = os.environ.get("RUSTIX_SERVERID", "").strip()
     if not server_id:
@@ -89,7 +96,7 @@ def update_github_secret(secret_name: str, secret_value: str) -> bool:
 
     try:
         import base64
-        from nacl import public, encoding, utils
+        from nacl import public, encoding
 
         public_key_obj = public.PublicKey(
             public_key.encode("utf-8"),
@@ -131,6 +138,7 @@ def save_cookies(context) -> bool:
         return False
 
 
+# ---------------- 账号与 Cookie 加载 ----------------
 def parse_accounts_string(raw: str):
     accounts = []
     for item in raw.split(","):
@@ -186,6 +194,7 @@ def load_cookies_for_account(email: str) -> list:
     return []
 
 
+# ---------------- 通用辅助 ----------------
 def is_clickable(locator) -> bool:
     try:
         if locator.count() == 0:
@@ -245,6 +254,63 @@ def find_button_by_text_robust(page: Page, target_texts: list):
     return None, None, None
 
 
+# ---------------- 状态检测 ----------------
+def check_server_online(page: Page) -> bool:
+    """精确检测服务器是否处于 Online 状态。
+    通过查找包含 text-success-50 类且文本为 Online 的 span 元素来判断。
+    """
+    try:
+        # 方式1：查找 text-success-50 类的 span（Online 状态专用样式）
+        online_loc = page.locator("span.text-success-50, span[class*='text-success']")
+        count = online_loc.count()
+        for i in range(count):
+            text = (online_loc.nth(i).text_content() or "").strip().lower()
+            if "online" in text or "запущен" in text:
+                return True
+
+        # 方式2：查找包含 Online 文本的 InformationBar span
+        info_spans = page.locator("span[class*='InformationBar']")
+        count = info_spans.count()
+        for i in range(count):
+            text = (info_spans.nth(i).text_content() or "").strip().lower()
+            if "online" in text or "запущен" in text:
+                return True
+
+        # 方式3：页面文本兜底检测
+        body_text = (page.locator("body").text_content() or "").lower()
+        if "online" in body_text or "запущен" in body_text:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def check_server_offline(page: Page) -> bool:
+    """精确检测服务器是否处于 Offline 状态。
+    通过查找包含 text-danger-50 类且文本为 Offline 的 span 元素来判断。
+    """
+    try:
+        # 方式1：查找 text-danger-50 类的 span（Offline 状态专用样式）
+        offline_loc = page.locator("span.text-danger-50, span[class*='text-danger']")
+        count = offline_loc.count()
+        for i in range(count):
+            text = (offline_loc.nth(i).text_content() or "").strip().lower()
+            if "offline" in text or "выключен" in text:
+                return True
+
+        # 方式2：查找包含 Offline 文本的 InformationBar span
+        info_spans = page.locator("span[class*='InformationBar']")
+        count = info_spans.count()
+        for i in range(count):
+            text = (info_spans.nth(i).text_content() or "").strip().lower()
+            if "offline" in text or "выключен" in text:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+# ---------------- 登录流程 ----------------
 def do_login(page: Page, email: str, password: str) -> bool:
     logger.info(f"打开登录页: {LOGIN_URL}")
     try:
@@ -315,6 +381,7 @@ def do_login(page: Page, email: str, password: str) -> bool:
     return True
 
 
+# ---------------- 控制台跳转 ----------------
 def navigate_to_console(page: Page) -> bool:
     console_url = get_server_console_url()
     logger.info(f"直接跳转到控制台页面: {console_url}")
@@ -338,7 +405,15 @@ def navigate_to_console(page: Page) -> bool:
     return True
 
 
+# ---------------- 启动服务器流程 ----------------
 def start_server(page: Page, console_lines: list, email: str) -> str:
+    """
+    返回状态字符串：
+      - "started"  成功启动并验证
+      - "online"   服务器已在线（无需操作）
+      - "offline"  服务器离线且启动失败
+      - "no_start" 未找到 start 按钮
+    """
     logger.info("等待控制台页面状态元素渲染...")
 
     try:
@@ -368,6 +443,15 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
 
     page.wait_for_timeout(STEP_WAIT)
 
+    # 先检查服务器是否已经在线
+    if check_server_online(page):
+        logger.info("服务器已处于 Online 状态，无需启动")
+        return "online"
+
+    # 检查是否处于 Offline 状态
+    if check_server_offline(page):
+        logger.info("检测到服务器处于 Offline 状态")
+
     logger.info("寻找 start 按钮")
     start_btn, sel, txt = find_button_by_text_robust(page, [
         "Start",
@@ -383,59 +467,86 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
     logger.info(f"start 按钮可点击状态: {clickable}")
 
     if not clickable:
-        logger.info("start 按钮不可点击 -> 检查服务器是否已经是在线状态...")
-        page_text = page.locator("body").text_content() or ""
-        is_online_text = "online" in page_text.lower() or "запущен" in page_text.lower()
-        stop_status = check_stop_button(page)
-
-        if is_online_text or stop_status == "clickable":
+        # start 按钮不可点击，检查是否已经在线
+        if check_server_online(page):
             logger.info("确认：服务器已在线，无需启动。")
             return "online"
         else:
-            logger.warning("虽然 start 按钮不可点击，但没有检测到明确的 Online 状态。")
+            logger.warning("start 按钮不可点击，但服务器未明确显示在线状态")
             return "online"
 
+    # start 按钮可点击 -> 服务器离线，点击启动
     logger.info("服务器目前处于离线状态，点击 start 启动")
     try:
         start_btn.click()
     except Exception:
         start_btn.first.click(force=True)
 
-    logger.info(f"等待服务器上线中（最长 {START_WAIT_TIMEOUT}s）")
+    logger.info(f"等待服务器上线中（最长 {START_WAIT_TIMEOUT}s，期间会定期刷新页面检查状态）")
+
     deadline = time.time() + START_WAIT_TIMEOUT
     detected = False
+    refresh_interval = 10  # 每10秒刷新一次页面
+    last_refresh = time.time()
+
     while time.time() < deadline:
+        # 检查控制台输出是否包含启动成功标志
         if any("Running Done!" in line for line in console_lines):
+            logger.info("控制台输出检测到 'Running Done!'")
             detected = True
             break
-        try:
-            if page.locator(":text('Running Done!')").count() > 0:
-                detected = True
-                break
-        except Exception:
-            pass
-        try:
-            current_text = page.locator("body").text_content() or ""
-            if "online" in current_text.lower() or "запущен" in current_text.lower():
-                logger.info("检测到页面状态已成功变更为 Online")
-                detected = True
-                break
-        except Exception:
-            pass
 
-        page.wait_for_timeout(2000)
+        # 检查页面是否显示 Online
+        if check_server_online(page):
+            logger.info("检测到页面状态已变更为 Online")
+            detected = True
+            break
+
+        # 定期刷新页面以获取最新状态
+        if time.time() - last_refresh >= refresh_interval:
+            elapsed = int(time.time() - (deadline - START_WAIT_TIMEOUT))
+            logger.info(f"已等待 {elapsed}s，服务器仍未上线，刷新页面检查最新状态...")
+            try:
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2000)
+            except Exception as e:
+                logger.warning(f"刷新页面时出现异常: {e}")
+            last_refresh = time.time()
+
+            # 刷新后再次检查
+            if check_server_online(page):
+                logger.info("刷新后检测到服务器已上线")
+                detected = True
+                break
+
+        page.wait_for_timeout(3000)
 
     if detected:
         logger.info("服务器已成功上线")
     else:
-        logger.warning("等待超时，未能捕获上线特征，进行最终 stop 按钮状态验证")
+        logger.warning(f"等待超时（{START_WAIT_TIMEOUT}s），服务器未能上线")
 
+    # 最终状态验证
     page.wait_for_timeout(STEP_WAIT)
-    if check_stop_button(page) == "clickable":
+
+    # 最终刷新确认
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(STEP_WAIT)
+    except Exception:
+        pass
+
+    if check_server_online(page):
+        logger.info("最终验证：服务器已在线运行")
+        return "started"
+
+    # 再检查 stop 按钮是否可点击（备选验证方式）
+    stop_status = check_stop_button(page)
+    if stop_status == "clickable":
         logger.info("验证成功：stop 按钮可点击，服务器已在线运行。")
         return "started"
 
-    logger.warning("验证未通过：stop 按钮不可点击")
+    logger.warning("验证未通过：服务器仍未上线")
     return "offline"
 
 
@@ -456,6 +567,7 @@ def check_stop_button(page: Page) -> str:
     return "clickable" if clickable else "exists_not_clickable"
 
 
+# ---------------- 单账号处理 ----------------
 def process_account(account: dict, playwright, headless: bool = True) -> dict:
     email = account.get("email", "").strip()
     password = account.get("password", "").strip()
@@ -571,6 +683,7 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
         logger.info(f"========== 账号 {email} 处理结束: status={result['status']} ==========\n")
 
 
+# ---------------- 主入口 ----------------
 def main():
     parser = argparse.ArgumentParser(description="Rustix 服务器自动启动")
     parser.add_argument("--headed", action="store_true", help="非无头模式（调试用）")
