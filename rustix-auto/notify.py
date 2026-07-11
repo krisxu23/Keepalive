@@ -119,11 +119,25 @@ def notify_account_result(result: dict) -> bool:
 
 
 def notify_summary(results: list) -> bool:
-    """批量执行汇总通知。"""
+    """批量执行汇总通知。
+    
+    只在以下情况发送通知：
+    - 有账号成功启动（之前离线，脚本唤醒成功）
+    - 有账号失败（登录失败、启动失败等）
+    - 所有账号都在线时不发送通知
+    """
     total = len(results)
     ok = sum(1 for r in results if r.get("ok"))
     fail = total - ok
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    online_count = sum(1 for r in results if r.get("status") == "online")
+    started_count = sum(1 for r in results if r.get("status") == "started")
+    has_failures = fail > 0
+
+    if online_count == total and not has_failures:
+        logger.info("所有账号均已在线，无需发送通知")
+        return False
 
     if fail == 0:
         overall = "🎉 全部成功"
@@ -139,6 +153,12 @@ def notify_summary(results: list) -> bool:
         f"⏰ <b>时间</b>: {now}",
         f"📈 <b>统计</b>: 共 {total} 个",
         f"✅ <b>成功</b> {ok} | ❌ <b>失败</b> {fail}",
+    ]
+    
+    if started_count > 0:
+        lines.append(f"🔄 <b>已唤醒</b> {started_count} 台")
+
+    lines += [
         "",
         "━" * 13,
         "<b>账号明细</b>",
