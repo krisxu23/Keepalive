@@ -1,13 +1,9 @@
 name: rustix-auto-alive
 
 on:
-  # 定时触发（已停用，改由 Uptime Kuma 触发）
-  # schedule:
-  #   - cron: '0 */6 * * *'
   # 支持手动触发
   workflow_dispatch:
   # 由 Uptime Kuma Webhook 触发（服务器离线时）
-  # 没有 uptime 可删除下面两行，并将定时触发重新启用
   repository_dispatch:
     types: [rustix]
 
@@ -18,7 +14,6 @@ concurrency:
 
 jobs:
   rustix-alive:
-    # workflow_dispatch 始终执行；repository_dispatch 仅 status 含 Down 时执行
     if: github.event_name != 'repository_dispatch' || contains(github.event.client_payload.status, 'Down')
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -52,8 +47,9 @@ jobs:
         working-directory: rustix-auto
         env:
           # 从 GitHub Secrets 读取账号，格式：邮箱:密码,邮箱:密码
-          # 例：a@example.com:pwd1,b@example.com:pwd2
           ACCOUNTS: ${{ secrets.RUSTIX_ACCOUNTS }}
+          # 【新增】从 GitHub Secrets 读取 Cookie JSON 字符串
+          RUSTIX_COOKIE: ${{ secrets.RUSTIX_COOKIE }}
           # Telegram 通知（可选，未配置 Secret 则不推送）
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
