@@ -1,11 +1,10 @@
 name: rustix-auto-alive
 
 on:
-  # 支持手动触发
-  workflow_dispatch:
-  # 由 Uptime Kuma Webhook 触发（服务器离线时）
-  repository_dispatch:
-    types: [rustix]
+  workflow_dispatch: # 由外部定时（如 cron-job.org）进行每小时触发
+  # 如果需要内部定时，可添加 schedule:
+  # schedule:
+  #   - cron: '0 * * * *'   # 每小时整点触发
 
 # 同一时间只允许一个实例运行
 concurrency:
