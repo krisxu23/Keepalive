@@ -5,7 +5,7 @@ Rustix 服务器自动启动脚本
 - 支持多账号轮流操作
 - 优先支持 Cookie 登录 (RUSTIX_COOKIE)，失效或未配置时自动降级至账号密码登录
 - 自动登录 https://my.rustix.me/auth/login
-- 点击 Manage Server -> 判断 start 按钮状态 -> 启动服务器
+- 通过服务器ID直接跳转控制台页面
 - 支持 Telegram 多节点实事网页截图发送，方便排查假登录与状态异常
 - 强力校验控制台前端路由跳转
 
@@ -25,7 +25,6 @@ from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout
 
 import notify
 
-# ---------------- 日志配置 ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -39,21 +38,21 @@ logger = logging.getLogger("rustix-auto")
 
 LOGIN_URL = "https://my.rustix.me/auth/login"
 HOME_URL = "https://my.rustix.me"
-# 启动后等待 "Running Done!" 的最长时间（秒）
 START_WAIT_TIMEOUT = 120
-# 各步骤通用等待（ms）
 STEP_WAIT = 3000
-# 登录页 SPA 渐进渲染等待（ms）
 LOGIN_PAGE_WAIT = 6000
-# 服务器列表卡片渲染等待（ms）
 DASHBOARD_LOAD_WAIT = 15000
-# 控制台页面加载等待（ms）
-CONSOLE_LOAD_WAIT = 10000
+CONSOLE_LOAD_WAIT = 15000
 
 
-# ---------------- Telegram 截图发送接口 ----------------
+def get_server_console_url() -> str:
+    server_id = os.environ.get("RUSTIX_SERVERID", "").strip()
+    if not server_id:
+        raise RuntimeError("未配置 RUSTIX_SERVERID 环境变量")
+    return f"https://my.rustix.me/server/{server_id}/console"
+
+
 def send_telegram_photo(photo_path: str, caption: str = "") -> bool:
-    """直接调用 Telegram Bot API 发送实时截图，方便远程排查。"""
     token = os.environ.get("TG_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TG_CHAT_ID", "").strip()
     if not token or not chat_id:
@@ -62,7 +61,7 @@ def send_telegram_photo(photo_path: str, caption: str = "") -> bool:
     if not os.path.exists(photo_path):
         logger.warning(f"未找到截图文件: {photo_path}")
         return False
-        
+
     url = f"https://api.telegram.org/bot{token}/sendPhoto"
     try:
         with open(photo_path, 'rb') as photo:
@@ -79,9 +78,7 @@ def send_telegram_photo(photo_path: str, caption: str = "") -> bool:
     return False
 
 
-# ---------------- 账号与 Cookie 加载 ----------------
 def parse_accounts_string(raw: str):
-    """解析 'email1:password1,email2:password2' 格式为账号列表。"""
     accounts = []
     for item in raw.split(","):
         item = item.strip()
@@ -95,7 +92,6 @@ def parse_accounts_string(raw: str):
 
 
 def load_accounts():
-    """读取账号配置。优先级：环境变量 ACCOUNTS > accounts.json 文件。"""
     accounts_env = os.environ.get("ACCOUNTS", "").strip()
     if accounts_env:
         accounts = parse_accounts_string(accounts_env)
@@ -118,7 +114,6 @@ def load_accounts():
 
 
 def load_cookies_for_account(email: str) -> list:
-    """从环境变量 RUSTIX_COOKIE 中解析当前账号的 Cookie 列表。"""
     cookie_env = os.environ.get("RUSTIX_COOKIE", "").strip()
     if not cookie_env:
         return []
@@ -138,9 +133,7 @@ def load_cookies_for_account(email: str) -> list:
     return []
 
 
-# ---------------- 通用辅助 ----------------
 def is_clickable(locator) -> bool:
-    """判断元素是否可点击：可见 + 可用 + 非禁用 + 可接收指针事件。"""
     try:
         if locator.count() == 0:
             return False
@@ -160,7 +153,6 @@ def is_clickable(locator) -> bool:
 
 
 def find_first_visible(page: Page, selectors):
-    """按顺序在 selectors 中寻找第一个存在且可见的元素，返回 (locator, selector)。"""
     for sel in selectors:
         try:
             loc = page.locator(sel).first
@@ -172,11 +164,6 @@ def find_first_visible(page: Page, selectors):
 
 
 def find_button_by_text_robust(page: Page, target_texts: list):
-    """
-    鲁棒地遍历页面按钮和链接元素。
-    通过提取 innerText/textContent，净化空白字符后进行不区分大小写的子串匹配，
-    从而解决 SVG 嵌套、类名混淆或多余空格导致的定位失败问题。
-    """
     for text in target_texts:
         try:
             loc = page.get_by_role("button").filter(has_text=text).first
@@ -205,7 +192,6 @@ def find_button_by_text_robust(page: Page, target_texts: list):
     return None, None, None
 
 
-# ---------------- 登录流程 ----------------
 def do_login(page: Page, email: str, password: str) -> bool:
     logger.info(f"打开登录页: {LOGIN_URL}")
     try:
@@ -215,14 +201,12 @@ def do_login(page: Page, email: str, password: str) -> bool:
 
     page.wait_for_timeout(LOGIN_PAGE_WAIT)
 
-    # 用户名/邮箱输入框
     email_loc, email_sel = find_first_visible(page, [
         'input[name="username"]',
         'input[type="email"]',
         'input[name="email"]',
         'input[autocomplete="username"]',
     ])
-    # 密码输入框
     pwd_loc, pwd_sel = find_first_visible(page, [
         'input[type="password"]',
         'input[name="password"]',
@@ -240,10 +224,9 @@ def do_login(page: Page, email: str, password: str) -> bool:
     pwd_loc.fill(password)
     page.wait_for_timeout(500)
 
-    # 登录按钮
     login_btn, login_sel, txt = find_button_by_text_robust(page, [
-        "Войти",          # 俄语
-        "Login",          # 英语
+        "Войти",
+        "Login",
         "Sign in",
     ])
     if not login_btn:
@@ -283,51 +266,16 @@ def do_login(page: Page, email: str, password: str) -> bool:
     return True
 
 
-# ---------------- Manage Server 流程 ----------------
-def click_manage_server(page: Page) -> bool:
-    logger.info("等待服务器列表卡片渲染完成...")
+def navigate_to_console(page: Page) -> bool:
+    console_url = get_server_console_url()
+    logger.info(f"直接跳转到控制台页面: {console_url}")
 
     try:
-        page.wait_for_selector(
-            'a[href*="/server/"][href*="/console"]',
-            timeout=DASHBOARD_LOAD_WAIT,
-        )
-        logger.info("检测到 Manage Server 链接已渲染")
+        page.goto(console_url, wait_until="domcontentloaded", timeout=60000)
+        logger.info(f"控制台页面加载完成，当前 URL: {page.url}")
     except Exception as e:
-        logger.warning(f"等待服务器卡片超时: {e}，继续尝试寻找按钮")
+        logger.warning(f"跳转控制台页面时出现异常: {e}")
 
-    page.wait_for_timeout(STEP_WAIT)
-
-    logger.info("寻找 Manage Server 按钮")
-
-    manage, sel, txt = find_button_by_text_robust(page, [
-        "Manage Server",
-        "Manage",
-        "Управление",
-        "Управлять сервером",
-    ])
-    if not manage:
-        manage, sel = find_first_visible(page, [
-            'a[href*="/server/"][href*="/console"]',
-            'a:has-text("Manage")',
-            'a:has-text("Управление")',
-            '[href*="manage" i]',
-        ])
-        txt = "Manage(fallback)"
-
-    if not manage:
-        page.screenshot(path="debug_no_manage_btn.png")
-        send_telegram_photo("debug_no_manage_btn.png", "❌ 登录成功后，但在控制面板主页未找到 'Manage Server' 按钮")
-        logger.error("未找到 Manage Server 按钮")
-        return False
-
-    logger.info(f"点击 Manage Server 按钮 (text={txt})")
-    try:
-        manage.click()
-    except Exception:
-        manage.first.click(force=True)
-
-    logger.info("等待控制台页面加载...")
     try:
         page.wait_for_url(
             lambda url: "/server/" in url and "/console" in url,
@@ -341,22 +289,14 @@ def click_manage_server(page: Page) -> bool:
     return True
 
 
-# ---------------- 启动服务器流程 ----------------
 def start_server(page: Page, console_lines: list, email: str) -> str:
-    """
-    返回状态字符串：
-      - "started"  成功启动并验证
-      - "online"   服务器已在线（无需操作）
-      - "offline"  服务器离线且启动失败
-      - "no_start" 未找到 start 按钮
-    """
     logger.info("等待控制台页面状态元素渲染...")
 
     try:
         page.wait_for_function(
             """() => {
-                const hasStart = document.querySelector('button') && 
-                    Array.from(document.querySelectorAll('button')).some(b => 
+                const hasStart = document.querySelector('button') &&
+                    Array.from(document.querySelectorAll('button')).some(b =>
                         b.textContent.trim().toLowerCase().includes('start') ||
                         b.textContent.trim().toLowerCase().includes('запустить')
                     );
@@ -392,11 +332,9 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
         logger.error("未找到 start 按钮")
         return "no_start"
 
-    # 3. 检查 start 按钮是否可点击
     clickable = is_clickable(start_btn)
     logger.info(f"start 按钮可点击状态: {clickable}")
 
-    # 4. 如果 start 按钮不可点击 (disabled)
     if not clickable:
         logger.info("start 按钮不可点击 -> 检查服务器是否已经是在线状态...")
         page_text = page.locator("body").text_content() or ""
@@ -414,14 +352,12 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
             send_telegram_photo("server_status_unknown.png", f"❓ 账号 {email} 的 Start 按钮不可点击，但页面未显示在线状态，请核实。")
             return "online"
 
-    # 5. 如果 start 按钮可点击，代表离线，点击启动
     logger.info("服务器目前处于离线状态，点击 start 启动")
     try:
         start_btn.click()
     except Exception:
         start_btn.first.click(force=True)
 
-    # 6. 循环等待直到上线
     logger.info(f"等待服务器上线中（最长 {START_WAIT_TIMEOUT}s）")
     deadline = time.time() + START_WAIT_TIMEOUT
     detected = False
@@ -451,14 +387,13 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
     else:
         logger.warning("等待超时，未能捕获上线特征，进行最终 stop 按钮状态验证")
 
-    # 7. 最终状态验证
     page.wait_for_timeout(STEP_WAIT)
     if check_stop_button(page) == "clickable":
         logger.info("验证成功：stop 按钮可点击，服务器已在线运行。发送喜报截图...")
         page.screenshot(path="server_start_success.png")
         send_telegram_photo("server_start_success.png", f"🚀 账号 {email} 的服务器已成功激活启动并验证上线！")
         return "started"
-    
+
     logger.warning("验证未通过：stop 按钮不可点击")
     page.screenshot(path="server_start_failed.png")
     send_telegram_photo("server_start_failed.png", f"❌ 账号 {email} 的服务器离线，且点击 Start 启动后验证失败，仍处于 Offline。")
@@ -466,10 +401,9 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
 
 
 def check_stop_button(page: Page) -> str:
-    """返回 'clickable' / 'exists_not_clickable' / 'not_found'。"""
     stop_btn, sel, txt = find_button_by_text_robust(page, [
-        "Stop",            # 英语
-        "Остановить",      # 俄语
+        "Stop",
+        "Остановить",
         "Power Off",
         "Shut down",
         "Shutdown",
@@ -483,7 +417,6 @@ def check_stop_button(page: Page) -> str:
     return "clickable" if clickable else "exists_not_clickable"
 
 
-# ---------------- 单账号处理 ----------------
 def process_account(account: dict, playwright, headless: bool = True) -> dict:
     email = account.get("email", "").strip()
     password = account.get("password", "").strip()
@@ -510,7 +443,6 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
         )
         page = context.new_page()
 
-        # 收集控制台消息
         console_lines = []
 
         def on_console(msg):
@@ -523,7 +455,6 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
         page.on("console", on_console)
         page.on("pageerror", lambda err: logger.warning(f"[pageerror] {err}"))
 
-        # 1. 尝试使用 Cookie 登录（首选）
         cookies = load_cookies_for_account(email)
         cookie_login_success = False
 
@@ -535,11 +466,9 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
                         c["domain"] = "my.rustix.me"
                 context.add_cookies(cookies)
 
-                # 访问主页
                 page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
                 page.wait_for_timeout(STEP_WAIT)
 
-                # 验证登录状态：是否被重定向到 /auth/login
                 if "/auth/login" not in page.url:
                     logger.info("Cookie 已注入，等待服务器列表卡片渲染以验证登录状态...")
                     try:
@@ -561,7 +490,6 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
             except Exception as e:
                 logger.warning(f"使用 Cookie 登录时出现异常，将切换密码登录: {e}")
 
-        # 2. 账号密码登录兜底
         if not cookie_login_success:
             logger.info("尝试使用传统账号密码方式登录...")
             if not do_login(page, email, password):
@@ -581,17 +509,14 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
                 logger.warning(f"等待服务器卡片加载超时: {e}")
             page.wait_for_timeout(STEP_WAIT)
 
-        # 拍摄登录成功后的控制台主页，并推送到 Telegram
         logger.info("已成功登录主面板！正在截取主页面验证...")
         page.screenshot(path="dashboard_success.png")
         send_telegram_photo("dashboard_success.png", f"🔓 账号 {email} 登录主面板验证成功！正在切换到控制台...")
 
-        # 3. 点击 Manage Server
-        if not click_manage_server(page):
-            result["error"] = "未找到 Manage Server"
+        if not navigate_to_console(page):
+            result["error"] = "跳转到控制台页面失败"
             return result
 
-        # 4. 启动服务器并验证
         status = start_server(page, console_lines, email)
         result["status"] = status
         result["ok"] = status in ("started", "online")
@@ -610,7 +535,6 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
         logger.info(f"========== 账号 {email} 处理结束: status={result['status']} ==========\n")
 
 
-# ---------------- 主入口 ----------------
 def main():
     parser = argparse.ArgumentParser(description="Rustix 服务器自动启动")
     parser.add_argument("--headed", action="store_true", help="非无头模式（调试用）")
@@ -636,7 +560,6 @@ def main():
             if idx < len(accounts):
                 time.sleep(5)
 
-    # 汇总
     logger.info("================ 结果汇总 ================")
     ok = 0
     for r in results:
