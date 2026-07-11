@@ -6,8 +6,8 @@ Rustix 服务器自动启动脚本
 - 优先支持 Cookie 登录 (RUSTIX_COOKIE)，失效或未配置时自动降级至账号密码登录
 - 自动登录 https://my.rustix.me/auth/login
 - 通过服务器ID直接跳转控制台页面
-- 支持 Telegram 多节点实事网页截图发送，方便排查假登录与状态异常
-- 强力校验控制台前端路由跳转
+- 自动刷新保存 Cookie 到 GitHub Repository Secrets
+- 仅发送汇总通知
 
 站点语言：俄语 / 英语（不支持中文）
 """
@@ -52,30 +52,96 @@ def get_server_console_url() -> str:
     return f"https://my.rustix.me/server/{server_id}/console"
 
 
-def send_telegram_photo(photo_path: str, caption: str = "") -> bool:
-    token = os.environ.get("TG_BOT_TOKEN", "").strip()
-    chat_id = os.environ.get("TG_CHAT_ID", "").strip()
-    if not token or not chat_id:
-        logger.info("未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过发送 TG 截图")
-        return False
-    if not os.path.exists(photo_path):
-        logger.warning(f"未找到截图文件: {photo_path}")
+def update_github_secret(secret_name: str, secret_value: str) -> bool:
+    gh_token = os.environ.get("GH_TOKEN", "").strip()
+    if not gh_token:
+        logger.info("未配置 GH_TOKEN，跳过更新 GitHub Secret")
         return False
 
-    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    repo_full_name = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    if not repo_full_name:
+        logger.warning("未获取到 GITHUB_REPOSITORY 环境变量，跳过更新 GitHub Secret")
+        return False
+
+    url = f"https://api.github.com/repos/{repo_full_name}/actions/secrets/{secret_name}"
+    headers = {
+        "Authorization": f"token {gh_token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
     try:
-        with open(photo_path, 'rb') as photo:
-            files = {'photo': photo}
-            data = {'chat_id': chat_id, 'caption': caption}
-            response = requests.post(url, data=data, files=files, timeout=15)
-            if response.status_code == 200:
-                logger.info(f"成功发送 Telegram 截图验证: {photo_path}")
-                return True
-            else:
-                logger.warning(f"发送 TG 截图失败，状态码: {response.status_code}, 响应: {response.text}")
+        resp = requests.get(url, headers=headers, timeout=10)
+        public_key_data = resp.json()
+        if resp.status_code != 200:
+            logger.warning(f"获取 GitHub Public Key 失败: {public_key_data}")
+            return False
+
+        public_key = public_key_data.get("key", "")
+        key_id = public_key_data.get("key_id", "")
+        if not public_key or not key_id:
+            logger.warning("获取到的 Public Key 不完整")
+            return False
     except Exception as e:
-        logger.warning(f"发送 TG 截图时出现网络异常: {e}")
-    return False
+        logger.warning(f"获取 GitHub Public Key 时出现异常: {e}")
+        return False
+
+    try:
+        from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
+        from cryptography.hazmat.backends import default_backend
+        import base64
+        import struct
+
+        key_bytes = base64.b64decode(public_key)
+        parts = []
+        while key_bytes:
+            length = struct.unpack(">I", key_bytes[:4])[0]
+            key_bytes = key_bytes[4:]
+            parts.append(key_bytes[:length])
+            key_bytes = key_bytes[length:]
+
+        n = int.from_bytes(parts[1], "big")
+        e = int.from_bytes(parts[2], "big")
+
+        public_numbers = RSAPublicNumbers(e, n)
+        public_key_obj = public_numbers.public_key(default_backend())
+
+        secret_bytes = secret_value.encode("utf-8")
+        encrypted = public_key_obj.encrypt(
+            secret_bytes,
+            None
+        )
+        encrypted_b64 = base64.b64encode(encrypted).decode("utf-8")
+
+        payload = {
+            "encrypted_value": encrypted_b64,
+            "key_id": key_id,
+        }
+        resp = requests.put(url, headers=headers, json=payload, timeout=10)
+        if resp.status_code == 201:
+            logger.info(f"成功更新 GitHub Secret: {secret_name}")
+            return True
+        else:
+            logger.warning(f"更新 GitHub Secret 失败，状态码: {resp.status_code}, 响应: {resp.text}")
+            return False
+    except Exception as e:
+        logger.warning(f"加密并更新 GitHub Secret 时出现异常: {e}")
+        return False
+
+
+def save_cookies(context) -> bool:
+    try:
+        cookies = context.cookies()
+        if not cookies:
+            logger.info("未获取到任何 Cookie")
+            return False
+
+        cookie_json = json.dumps(cookies, indent=2)
+        logger.info(f"获取到 {len(cookies)} 个 Cookie，准备更新到 GitHub Secret")
+
+        return update_github_secret("RUSTIX_COOKIE", cookie_json)
+    except Exception as e:
+        logger.warning(f"获取并保存 Cookie 时出现异常: {e}")
+        return False
 
 
 def parse_accounts_string(raw: str):
@@ -214,8 +280,6 @@ def do_login(page: Page, email: str, password: str) -> bool:
     ])
 
     if not email_loc or not pwd_loc:
-        page.screenshot(path="debug_login_form_error.png")
-        send_telegram_photo("debug_login_form_error.png", f"❌ 账号 {email} 未能加载到登录表单")
         logger.error("未找到登录表单")
         return False
 
@@ -237,8 +301,6 @@ def do_login(page: Page, email: str, password: str) -> bool:
         txt = "submit(fallback)"
 
     if not login_btn:
-        page.screenshot(path="debug_login_btn_error.png")
-        send_telegram_photo("debug_login_btn_error.png", f"❌ 账号 {email} 未找到登录按钮")
         logger.error("未找到登录按钮")
         return False
 
@@ -327,8 +389,6 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
         "Boot",
     ])
     if not start_btn:
-        page.screenshot(path="debug_no_start_btn.png")
-        send_telegram_photo("debug_no_start_btn.png", f"⚠️ 账号 {email} 在控制台页面未找到 Start 按钮 (已拍照，请排查)")
         logger.error("未找到 start 按钮")
         return "no_start"
 
@@ -342,14 +402,10 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
         stop_status = check_stop_button(page)
 
         if is_online_text or stop_status == "clickable":
-            logger.info("确认：服务器已在线，无需启动。拍摄在线截图...")
-            page.screenshot(path="server_status_online.png")
-            send_telegram_photo("server_status_online.png", f"ℹ️ 账号 {email} 的服务器已经处于 Online (在线状态)，无需再启动。")
+            logger.info("确认：服务器已在线，无需启动。")
             return "online"
         else:
             logger.warning("虽然 start 按钮不可点击，但没有检测到明确的 Online 状态。")
-            page.screenshot(path="server_status_unknown.png")
-            send_telegram_photo("server_status_unknown.png", f"❓ 账号 {email} 的 Start 按钮不可点击，但页面未显示在线状态，请核实。")
             return "online"
 
     logger.info("服务器目前处于离线状态，点击 start 启动")
@@ -389,14 +445,10 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
 
     page.wait_for_timeout(STEP_WAIT)
     if check_stop_button(page) == "clickable":
-        logger.info("验证成功：stop 按钮可点击，服务器已在线运行。发送喜报截图...")
-        page.screenshot(path="server_start_success.png")
-        send_telegram_photo("server_start_success.png", f"🚀 账号 {email} 的服务器已成功激活启动并验证上线！")
+        logger.info("验证成功：stop 按钮可点击，服务器已在线运行。")
         return "started"
 
     logger.warning("验证未通过：stop 按钮不可点击")
-    page.screenshot(path="server_start_failed.png")
-    send_telegram_photo("server_start_failed.png", f"❌ 账号 {email} 的服务器离线，且点击 Start 启动后验证失败，仍处于 Offline。")
     return "offline"
 
 
@@ -493,8 +545,6 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
         if not cookie_login_success:
             logger.info("尝试使用传统账号密码方式登录...")
             if not do_login(page, email, password):
-                page.screenshot(path="login_failed.png")
-                send_telegram_photo("login_failed.png", f"❌ 账号 {email} 登录失败（Cookie 和密码均失效）")
                 result["error"] = "登录失败（Cookie 和 密码均尝试完毕）"
                 return result
             logger.info("密码登录成功，跳转到服务器总览页面并等待加载...")
@@ -509,9 +559,8 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
                 logger.warning(f"等待服务器卡片加载超时: {e}")
             page.wait_for_timeout(STEP_WAIT)
 
-        logger.info("已成功登录主面板！正在截取主页面验证...")
-        page.screenshot(path="dashboard_success.png")
-        send_telegram_photo("dashboard_success.png", f"🔓 账号 {email} 登录主面板验证成功！正在切换到控制台...")
+        logger.info("已成功登录主面板！")
+        save_cookies(context)
 
         if not navigate_to_console(page):
             result["error"] = "跳转到控制台页面失败"
