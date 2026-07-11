@@ -12,6 +12,11 @@ concurrency:
   group: rustix-auto
   cancel-in-progress: false
 
+permissions:
+  repository-projects: write
+  actions: write
+  contents: write
+
 jobs:
   rustix-alive:
     if: github.event_name != 'repository_dispatch' || contains(github.event.client_payload.status, 'Down')
@@ -55,6 +60,8 @@ jobs:
           # Telegram 通知（可选，未配置 Secret 则不推送）
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # GitHub Token，用于更新 Repository Secrets（自动刷新 Cookie）
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: python main.py
 
       - name: 上传运行日志
