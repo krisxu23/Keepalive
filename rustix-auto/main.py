@@ -45,6 +45,10 @@ START_WAIT_TIMEOUT = 120
 STEP_WAIT = 3000
 # 登录页 SPA 渐进渲染等待（ms）
 LOGIN_PAGE_WAIT = 6000
+# 服务器列表卡片渲染等待（ms）
+DASHBOARD_LOAD_WAIT = 15000
+# 控制台页面加载等待（ms）
+CONSOLE_LOAD_WAIT = 10000
 
 
 # ---------------- Telegram 截图发送接口 ----------------
@@ -281,17 +285,30 @@ def do_login(page: Page, email: str, password: str) -> bool:
 
 # ---------------- Manage Server 流程 ----------------
 def click_manage_server(page: Page) -> bool:
-    logger.info("寻找 Manage Server 按钮")
+    logger.info("等待服务器列表卡片渲染完成...")
+
+    try:
+        page.wait_for_selector(
+            'a[href*="/server/"][href*="/console"]',
+            timeout=DASHBOARD_LOAD_WAIT,
+        )
+        logger.info("检测到 Manage Server 链接已渲染")
+    except Exception as e:
+        logger.warning(f"等待服务器卡片超时: {e}，继续尝试寻找按钮")
+
     page.wait_for_timeout(STEP_WAIT)
+
+    logger.info("寻找 Manage Server 按钮")
 
     manage, sel, txt = find_button_by_text_robust(page, [
         "Manage Server",
         "Manage",
-        "Управление",      # 俄语
+        "Управление",
         "Управлять сервером",
     ])
     if not manage:
         manage, sel = find_first_visible(page, [
+            'a[href*="/server/"][href*="/console"]',
             'a:has-text("Manage")',
             'a:has-text("Управление")',
             '[href*="manage" i]',
@@ -310,15 +327,17 @@ def click_manage_server(page: Page) -> bool:
     except Exception:
         manage.first.click(force=True)
 
-    # 强校验：使用 lambda 表达式监控 URL 的改变，只有确认包含 /server/ 且包含 /console 路由才算跳转成功
-    logger.info("等待 URL 强切到控制台页面...")
+    logger.info("等待控制台页面加载...")
     try:
-        page.wait_for_url(lambda url: "/server/" in url and "/console" in url, timeout=15000)
+        page.wait_for_url(
+            lambda url: "/server/" in url and "/console" in url,
+            timeout=CONSOLE_LOAD_WAIT,
+        )
         logger.info(f"路由跳转成功，当前真实 URL: {page.url}")
     except Exception as e:
         logger.warning(f"等待 URL 路由重定向超时，当前 URL: {page.url}。将继续流程...")
 
-    page.wait_for_timeout(3000)
+    page.wait_for_timeout(STEP_WAIT)
     return True
 
 
@@ -331,26 +350,36 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
       - "offline"  服务器离线且启动失败
       - "no_start" 未找到 start 按钮
     """
-    logger.info("寻找 start 按钮")
+    logger.info("等待控制台页面状态元素渲染...")
 
-    # 1. 监控真正的控制台页面渲染
-    logger.info("等待控制台页面关键状态渲染...")
     try:
         page.wait_for_function(
             """() => {
-                const text = document.body.innerText || "";
-                return text.includes("Start") || text.includes("Stop") || 
-                       text.includes("Online") || text.includes("Offline") ||
-                       text.includes("Запустить") || text.includes("Остановить") ||
-                       text.includes("Запущен") || text.includes("Выключен");
+                const hasStart = document.querySelector('button') && 
+                    Array.from(document.querySelectorAll('button')).some(b => 
+                        b.textContent.trim().toLowerCase().includes('start') ||
+                        b.textContent.trim().toLowerCase().includes('запустить')
+                    );
+                const hasStop = document.querySelector('button') &&
+                    Array.from(document.querySelectorAll('button')).some(b =>
+                        b.textContent.trim().toLowerCase().includes('stop') ||
+                        b.textContent.trim().toLowerCase().includes('остановить')
+                    );
+                const hasOnline = document.body.innerText.toLowerCase().includes('online') ||
+                                  document.body.innerText.toLowerCase().includes('запущен');
+                const hasOffline = document.body.innerText.toLowerCase().includes('offline') ||
+                                   document.body.innerText.toLowerCase().includes('выключен');
+                return hasStart || hasStop || hasOnline || hasOffline;
             }""",
-            timeout=20000
+            timeout=CONSOLE_LOAD_WAIT,
         )
-        logger.info("控制台状态渲染成功")
+        logger.info("控制台状态元素渲染成功")
     except Exception as e:
-        logger.warning(f"等待页面状态渲染超时，继续尝试匹配: {e}")
+        logger.warning(f"等待控制台状态渲染超时: {e}，继续尝试匹配")
 
-    # 2. 寻找 Start 按钮
+    page.wait_for_timeout(STEP_WAIT)
+
+    logger.info("寻找 start 按钮")
     start_btn, sel, txt = find_button_by_text_robust(page, [
         "Start",
         "Запустить",
@@ -510,17 +539,21 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
                 page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
                 page.wait_for_timeout(STEP_WAIT)
 
-                # 验证登录状态：是否被重定向到 /auth/login 且能匹配到 Manage 按钮
+                # 验证登录状态：是否被重定向到 /auth/login
                 if "/auth/login" not in page.url:
-                    manage, _, _ = find_button_by_text_robust(page, ["Manage Server", "Manage", "Управление"])
-                    if manage:
-                        logger.info("Cookie 验证成功！已直接登录。")
+                    logger.info("Cookie 已注入，等待服务器列表卡片渲染以验证登录状态...")
+                    try:
+                        page.wait_for_selector(
+                            'a[href*="/server/"][href*="/console"]',
+                            timeout=DASHBOARD_LOAD_WAIT,
+                        )
+                        logger.info("Cookie 验证成功！服务器列表已加载。")
                         cookie_login_success = True
-                    else:
-                        page.wait_for_timeout(STEP_WAIT)
+                    except Exception as e:
+                        logger.warning(f"等待服务器卡片超时: {e}")
                         manage, _, _ = find_button_by_text_robust(page, ["Manage Server", "Manage", "Управление"])
                         if manage:
-                            logger.info("Cookie 验证成功！已直接登录。")
+                            logger.info("Cookie 验证成功！找到 Manage Server 按钮。")
                             cookie_login_success = True
 
                 if not cookie_login_success:
@@ -536,6 +569,17 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
                 send_telegram_photo("login_failed.png", f"❌ 账号 {email} 登录失败（Cookie 和密码均失效）")
                 result["error"] = "登录失败（Cookie 和 密码均尝试完毕）"
                 return result
+            logger.info("密码登录成功，跳转到服务器总览页面并等待加载...")
+            page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
+            try:
+                page.wait_for_selector(
+                    'a[href*="/server/"][href*="/console"]',
+                    timeout=DASHBOARD_LOAD_WAIT,
+                )
+                logger.info("服务器列表卡片已加载")
+            except Exception as e:
+                logger.warning(f"等待服务器卡片加载超时: {e}")
+            page.wait_for_timeout(STEP_WAIT)
 
         # 拍摄登录成功后的控制台主页，并推送到 Telegram
         logger.info("已成功登录主面板！正在截取主页面验证...")
