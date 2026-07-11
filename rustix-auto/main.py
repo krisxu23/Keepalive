@@ -63,61 +63,48 @@ def update_github_secret(secret_name: str, secret_value: str) -> bool:
         logger.warning("未获取到 GITHUB_REPOSITORY 环境变量，跳过更新 GitHub Secret")
         return False
 
-    url = f"https://api.github.com/repos/{repo_full_name}/actions/secrets/{secret_name}"
+    public_key_url = f"https://api.github.com/repos/{repo_full_name}/actions/secrets/public-key"
+    secret_url = f"https://api.github.com/repos/{repo_full_name}/actions/secrets/{secret_name}"
     headers = {
         "Authorization": f"token {gh_token}",
         "Accept": "application/vnd.github.v3+json",
     }
 
     try:
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = requests.get(public_key_url, headers=headers, timeout=10)
         public_key_data = resp.json()
         if resp.status_code != 200:
-            logger.warning(f"获取 GitHub Public Key 失败: {public_key_data}")
+            logger.warning(f"获取 GitHub Public Key 失败，状态码: {resp.status_code}, 响应: {public_key_data}")
             return False
 
         public_key = public_key_data.get("key", "")
         key_id = public_key_data.get("key_id", "")
         if not public_key or not key_id:
-            logger.warning("获取到的 Public Key 不完整")
+            logger.warning(f"获取到的 Public Key 不完整: {public_key_data}")
             return False
+        logger.info(f"成功获取 GitHub Public Key (key_id={key_id})")
     except Exception as e:
         logger.warning(f"获取 GitHub Public Key 时出现异常: {e}")
         return False
 
     try:
-        from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicNumbers
-        from cryptography.hazmat.backends import default_backend
         import base64
-        import struct
+        from nacl import public, encoding, utils
 
-        key_bytes = base64.b64decode(public_key)
-        parts = []
-        while key_bytes:
-            length = struct.unpack(">I", key_bytes[:4])[0]
-            key_bytes = key_bytes[4:]
-            parts.append(key_bytes[:length])
-            key_bytes = key_bytes[length:]
-
-        n = int.from_bytes(parts[1], "big")
-        e = int.from_bytes(parts[2], "big")
-
-        public_numbers = RSAPublicNumbers(e, n)
-        public_key_obj = public_numbers.public_key(default_backend())
-
-        secret_bytes = secret_value.encode("utf-8")
-        encrypted = public_key_obj.encrypt(
-            secret_bytes,
-            None
+        public_key_obj = public.PublicKey(
+            public_key.encode("utf-8"),
+            encoding.Base64Encoder()
         )
+        sealed_box = public.SealedBox(public_key_obj)
+        encrypted = sealed_box.encrypt(secret_value.encode("utf-8"))
         encrypted_b64 = base64.b64encode(encrypted).decode("utf-8")
 
         payload = {
             "encrypted_value": encrypted_b64,
             "key_id": key_id,
         }
-        resp = requests.put(url, headers=headers, json=payload, timeout=10)
-        if resp.status_code == 201:
+        resp = requests.put(secret_url, headers=headers, json=payload, timeout=10)
+        if resp.status_code in (201, 204):
             logger.info(f"成功更新 GitHub Secret: {secret_name}")
             return True
         else:
