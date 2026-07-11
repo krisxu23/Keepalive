@@ -3,6 +3,7 @@
 """
 Rustix 服务器自动启动脚本
 - 支持多账号轮流操作
+- 优先支持 Cookie 登录 (RUSTIX_COOKIE)，失效或未配置时自动降级至账号密码登录
 - 自动登录 https://my.rustix.me/auth/login
 - 点击 Manage Server -> 判断 start 按钮状态 -> 启动服务器
 - 监听浏览器控制台 "Running Done!" 确认上线
@@ -45,13 +46,9 @@ STEP_WAIT = 3000
 LOGIN_PAGE_WAIT = 6000
 
 
-# ---------------- 账号加载 ----------------
+# ---------------- 账号与 Cookie 加载 ----------------
 def parse_accounts_string(raw: str):
-    """解析 'email1:password1,email2:password2' 格式为账号列表。
-
-    - 逗号分隔多个账号
-    - 每个账号用第一个冒号分割邮箱与密码（密码可含冒号，但不能含逗号）
-    """
+    """解析 'email1:password1,email2:password2' 格式为账号列表。"""
     accounts = []
     for item in raw.split(","):
         item = item.strip()
@@ -85,6 +82,35 @@ def load_accounts():
     raise RuntimeError(
         "未配置账号：请设置环境变量 ACCOUNTS（格式 email:password,...）或创建 accounts.json"
     )
+
+
+def load_cookies_for_account(email: str) -> list:
+    """从环境变量 RUSTIX_COOKIE 中解析当前账号的 Cookie 列表。
+    
+    支持格式：
+    1. 单个账号的 JSON 数组: [{"name": "...", "value": "..."}, ...]
+    2. 多账号映射字典: {"user1@email.com": [{"name": "..."}, ...], "user2@email.com": [...]}
+    """
+    cookie_env = os.environ.get("RUSTIX_COOKIE", "").strip()
+    if not cookie_env:
+        return []
+    try:
+        data = json.loads(cookie_env)
+        # 格式 1：多账号字典映射
+        if isinstance(data, dict) and email in data:
+            logger.info(f"成功匹配到账号 {email} 的专属 Cookie 配置")
+            return data[email]
+        # 格式 2：单个账号的 Cookie 数组
+        if isinstance(data, list):
+            logger.info(f"载入通用/单账号 Cookie 配置")
+            return data
+        # 格式 3：单个 Cookie 字典字典
+        if isinstance(data, dict) and "name" in data:
+            logger.info(f"载入单条 Cookie 配置")
+            return [data]
+    except Exception as e:
+        logger.warning(f"解析 RUSTIX_COOKIE 失败 (请确保其为合法的 JSON 格式): {e}")
+    return []
 
 
 # ---------------- 通用辅助 ----------------
@@ -264,9 +290,6 @@ def start_server(page: Page, console_lines: list) -> str:
       - "online"   服务器已在线（start 不可点击）
       - "offline"  服务器离线且启动失败
       - "no_start" 未找到 start 按钮
-
-    实测页面结构：按钮为 button[type="submit"]，文本 Start/Restart/Stop，
-    服务器在线时 Start 带 disabled 属性，Stop 可点击。
     """
     logger.info("寻找 start 按钮")
     page.wait_for_timeout(STEP_WAIT)
@@ -277,7 +300,7 @@ def start_server(page: Page, console_lines: list) -> str:
     except PWTimeout:
         pass
 
-    # 重新查找（wait_for_selector 后元素已稳定）
+    # 重新查找
     start_btn, sel, txt = find_button_by_text(page, [
         "Start",
         "Запустить",
@@ -401,17 +424,55 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
         page.on("console", on_console)
         page.on("pageerror", lambda err: logger.warning(f"[pageerror] {err}"))
 
-        # 1. 登录
-        if not do_login(page, email, password):
-            result["error"] = "登录失败"
-            return result
+        # 1. 尝试使用 Cookie 登录（首选）
+        cookies = load_cookies_for_account(email)
+        cookie_login_success = False
 
-        # 2. 点击 Manage Server
+        if cookies:
+            logger.info("检测到 RUSTIX_COOKIE 配置，尝试通过 Cookie 导入登录...")
+            try:
+                # 规范化 Cookie 域名格式，确保 Playwright 正常注入
+                for c in cookies:
+                    if "domain" not in c:
+                        c["domain"] = "my.rustix.me"
+                context.add_cookies(cookies)
+
+                # 访问主页
+                page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(STEP_WAIT)
+
+                # 验证登录是否成功：没有被反向重定向到登录页，且页面中能检测到管理按钮
+                if "/auth/login" not in page.url:
+                    manage, _, _ = find_button_by_text(page, ["Manage Server", "Manage", "Управление"])
+                    if manage:
+                        logger.info("Cookie 验证成功！已直接登录。")
+                        cookie_login_success = True
+                    else:
+                        # 额外等待 SPA 渐进渲染，再重试一次按钮检测
+                        page.wait_for_timeout(STEP_WAIT)
+                        manage, _, _ = find_button_by_text(page, ["Manage Server", "Manage", "Управление"])
+                        if manage:
+                            logger.info("Cookie 验证成功！已直接登录。")
+                            cookie_login_success = True
+
+                if not cookie_login_success:
+                    logger.warning("Cookie 登录验证未通过（未能发现管理选项或被重定向至登录页）。")
+            except Exception as e:
+                logger.warning(f"使用 Cookie 登录时出现异常，将切换密码登录: {e}")
+
+        # 2. 如果 Cookie 登录失败或未配置 Cookie，降级使用密码登录
+        if not cookie_login_success:
+            logger.info("尝试使用传统账号密码方式登录...")
+            if not do_login(page, email, password):
+                result["error"] = "登录失败（Cookie 和 密码均尝试完毕）"
+                return result
+
+        # 3. 点击 Manage Server
         if not click_manage_server(page):
             result["error"] = "未找到 Manage Server"
             return result
 
-        # 3. 启动服务器并验证
+        # 4. 启动服务器并验证
         status = start_server(page, console_lines)
         result["status"] = status
         result["ok"] = status in ("started", "online")
