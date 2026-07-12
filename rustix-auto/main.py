@@ -284,18 +284,29 @@ def find_stop_button(page: Page):
 
 def check_server_online(page: Page) -> bool:
     """检测服务器是否在线：
-    1. 页面显示 Online 状态文字
-    2. Start 按钮不可点击（说明已启动）
-    3. Stop 按钮可点击（说明正在运行）
+    1. 精确匹配服务器卡片上的 Online 状态标签（text-success-50）
+    2. Start 按钮不可点击 + Stop 按钮可点击
     """
     try:
-        # 方式1：检查状态标签是否显示 Online
-        body_text = (page.locator("body").text_content() or "").lower()
-        if "online" in body_text and "offline" not in body_text:
-            return True
+        # 方式1：精确匹配服务器卡片上的 Online 状态标签
+        status_spans = page.locator("span.text-success-50, span[class*='text-success']")
+        count = status_spans.count()
+        for i in range(count):
+            text = (status_spans.nth(i).text_content() or "").strip().lower()
+            if text == "online" or text == "запущен":
+                logger.info(f"检测到精确状态标签: Online")
+                return True
 
-        # 方式2：Start 按钮不可点击 + 显示 Offline 状态 = 离线
-        # 方式3：Start 按钮不可点击 + 显示 Online 状态 = 在线
+        # 方式2：精确匹配 ServerCardGradient 状态标签
+        card_spans = page.locator("span[class*='ServerCardGradient']")
+        count = card_spans.count()
+        for i in range(count):
+            text = (card_spans.nth(i).text_content() or "").strip().lower()
+            if text == "online" or text == "запущен":
+                logger.info(f"检测到 ServerCardGradient 状态: Online")
+                return True
+
+        # 方式3：Start/Stop 按钮组合判断
         start_btn, _, _ = find_start_button(page)
         stop_btn, _, _ = find_stop_button(page)
 
@@ -304,20 +315,16 @@ def check_server_online(page: Page) -> bool:
             stop_clickable = is_clickable(stop_btn)
             logger.info(f"状态判定: Start可点击={start_clickable}, Stop可点击={stop_clickable}")
 
-            # 在线：Start不可点击 + Stop可点击
             if not start_clickable and stop_clickable:
                 return True
-
-            # 离线：Start可点击 + Stop不可点击
             if start_clickable and not stop_clickable:
                 return False
 
-        # 方式4：兜底 - 如果明确显示 online 且没有 offline
-        # 注意：页面可能同时包含 online 和 offline（比如控制台日志），所以需要更精确
-        status_bar = page.locator('[class*="InformationBar"], [class*="status"], [class*="Status"]')
-        count = status_bar.count()
+        # 方式4：兜底 - 检查 InformationBar 状态标签
+        info_spans = page.locator('[class*="InformationBar"]')
+        count = info_spans.count()
         for i in range(count):
-            text = (status_bar.nth(i).text_content() or "").strip().lower()
+            text = (info_spans.nth(i).text_content() or "").strip().lower()
             if text == "online" or text == "запущен":
                 return True
             if text == "offline" or text == "выключен":
@@ -327,11 +334,60 @@ def check_server_online(page: Page) -> bool:
     return False
 
 
+def check_dashboard_online(page: Page) -> bool:
+    """跳转到总览页面检查服务器卡片状态"""
+    try:
+        page.goto(HOME_URL, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(3000)
+
+        status_spans = page.locator("span.text-success-50, span[class*='text-success']")
+        count = status_spans.count()
+        for i in range(count):
+            text = (status_spans.nth(i).text_content() or "").strip().lower()
+            if text == "online" or text == "запущен":
+                logger.info(f"总览页面检测到状态标签: Online")
+                return True
+
+        card_spans = page.locator("span[class*='ServerCardGradient']")
+        count = card_spans.count()
+        for i in range(count):
+            text = (card_spans.nth(i).text_content() or "").strip().lower()
+            if text == "online" or text == "запущен":
+                logger.info(f"总览页面 ServerCardGradient 状态: Online")
+                return True
+
+        logger.info("总览页面未检测到 Online 状态")
+        return False
+    except Exception as e:
+        logger.warning(f"检查总览页面状态异常: {e}")
+        return False
+
+
 def check_server_offline(page: Page) -> bool:
     """检测服务器是否离线：
-    Start 按钮可点击 + Stop 按钮不可点击
+    1. 精确匹配服务器卡片上的 Offline 状态标签（text-danger-50）
+    2. Start 按钮可点击 + Stop 按钮不可点击
     """
     try:
+        # 方式1：精确匹配服务器卡片上的 Offline 状态标签
+        status_spans = page.locator("span.text-danger-50, span[class*='text-danger']")
+        count = status_spans.count()
+        for i in range(count):
+            text = (status_spans.nth(i).text_content() or "").strip().lower()
+            if text == "offline" or text == "выключен":
+                logger.info(f"检测到精确状态标签: Offline")
+                return True
+
+        # 方式2：精确匹配 ServerCardGradient 状态标签
+        card_spans = page.locator("span[class*='ServerCardGradient']")
+        count = card_spans.count()
+        for i in range(count):
+            text = (card_spans.nth(i).text_content() or "").strip().lower()
+            if text == "offline" or text == "выключен":
+                logger.info(f"检测到 ServerCardGradient 状态: Offline")
+                return True
+
+        # 方式3：Start/Stop 按钮组合判断
         start_btn, _, _ = find_start_button(page)
         stop_btn, _, _ = find_stop_button(page)
 
@@ -344,11 +400,6 @@ def check_server_offline(page: Page) -> bool:
             # 在线：Start不可点击 + Stop可点击
             if not start_clickable and stop_clickable:
                 return False
-
-        # 兜底：检查 Offline 文字
-        body_text = (page.locator("body").text_content() or "").lower()
-        if "offline" in body_text and "online" not in body_text:
-            return True
     except Exception:
         pass
     return False
@@ -562,6 +613,18 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
                 logger.info("刷新后检测到服务器已上线")
                 detected = True
                 break
+
+            # 额外检查：跳转到总览页面验证服务器卡片状态
+            if elapsed > 60:
+                logger.info("额外验证：跳转到总览页面检查服务器卡片状态...")
+                if check_dashboard_online(page):
+                    logger.info("总览页面确认服务器已在线")
+                    detected = True
+                    break
+                # 回到控制台页面继续等待
+                console_url = get_server_console_url()
+                page.goto(console_url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2000)
 
         page.wait_for_timeout(3000)
 
