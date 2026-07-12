@@ -202,10 +202,9 @@ def find_first_visible(page: Page, selectors):
 
 
 def find_button_by_text(page: Page, target_texts: list):
-    """更可靠的按钮查找方式：遍历所有按钮元素，检查文本内容"""
+    """通用按钮查找：遍历所有按钮元素，检查文本内容"""
     all_buttons = page.locator('button, a, [role="button"]')
     count = all_buttons.count()
-    logger.debug(f"页面上共找到 {count} 个按钮/链接元素")
 
     for i in range(count):
         try:
@@ -216,7 +215,6 @@ def find_button_by_text(page: Page, target_texts: list):
             text_clean = " ".join(text_content.split()).strip()
             for target in target_texts:
                 if target.lower() in text_clean.lower():
-                    logger.debug(f"找到匹配按钮: '{text_clean}' (目标: {target})")
                     return el, f"button_{i}", text_clean
         except Exception:
             continue
@@ -224,15 +222,77 @@ def find_button_by_text(page: Page, target_texts: list):
     return None, None, None
 
 
+def find_start_button(page: Page):
+    """精确查找 Start 按钮：按钮元素 + 文本包含 Start/Запустить + 没有 disabled"""
+    all_buttons = page.locator('button')
+    count = all_buttons.count()
+    
+    for i in range(count):
+        try:
+            el = all_buttons.nth(i)
+            if not el.is_visible():
+                continue
+            text_content = el.text_content() or ""
+            text_clean = " ".join(text_content.split()).strip().lower()
+            
+            if "start" in text_clean or "запустить" in text_clean or "power on" in text_clean:
+                logger.info(f"找到 Start 按钮: '{text_clean}' (索引{i})")
+                return el, f"start_button_{i}", text_clean
+        except Exception:
+            continue
+    
+    # 兜底：查找所有可点击元素
+    all_elements = page.locator('[role="button"], a')
+    count = all_elements.count()
+    for i in range(count):
+        try:
+            el = all_elements.nth(i)
+            if not el.is_visible():
+                continue
+            text_content = el.text_content() or ""
+            text_clean = " ".join(text_content.split()).strip().lower()
+            if "start" in text_clean or "запустить" in text_clean:
+                logger.info(f"找到 Start 元素(兜底): '{text_clean}'")
+                return el, f"start_el_{i}", text_clean
+        except Exception:
+            continue
+    
+    return None, None, None
+
+
+def find_stop_button(page: Page):
+    """精确查找 Stop 按钮"""
+    all_buttons = page.locator('button')
+    count = all_buttons.count()
+    
+    for i in range(count):
+        try:
+            el = all_buttons.nth(i)
+            if not el.is_visible():
+                continue
+            text_content = el.text_content() or ""
+            text_clean = " ".join(text_content.split()).strip().lower()
+            
+            if "stop" in text_clean or "остановить" in text_clean or "power off" in text_clean:
+                logger.info(f"找到 Stop 按钮: '{text_clean}' (索引{i})")
+                return el, f"stop_button_{i}", text_clean
+        except Exception:
+            continue
+    
+    return None, None, None
+
+
 def check_server_online(page: Page) -> bool:
     """检测服务器是否在线：检查页面文本和按钮状态"""
     try:
+        # 方式1：检查页面文本
         body_text = (page.locator("body").text_content() or "").lower()
         if "online" in body_text or "запущен" in body_text:
             return True
 
-        stop_btn, _, _ = find_button_by_text(page, ["Stop", "Остановить"])
-        if stop_btn and is_clickable(stop_btn):
+        # 方式2：检查 Stop 按钮是否存在（服务器在线时才会有 Stop 按钮）
+        stop_btn, _, _ = find_stop_button(page)
+        if stop_btn:
             return True
     except Exception:
         pass
@@ -359,7 +419,7 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
         logger.info("检测到服务器处于 Offline 状态")
 
     logger.info("寻找 start 按钮")
-    start_btn, sel, txt = find_button_by_text(page, ["Start", "Запустить", "Power On"])
+    start_btn, sel, txt = find_start_button(page)
     if not start_btn:
         logger.error("未找到 start 按钮")
         return "no_start"
@@ -376,10 +436,52 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
             return "online"
 
     logger.info("服务器离线，点击 start 启动")
+    
+    start_clicked = False
     try:
+        # 方式1：普通点击
         start_btn.click()
+        start_clicked = True
+        logger.info("Start 按钮已点击（方式1）")
+    except Exception as e:
+        logger.warning(f"普通点击失败: {e}")
+        try:
+            # 方式2：force 点击
+            start_btn.first.click(force=True)
+            start_clicked = True
+            logger.info("Start 按钮已点击（方式2: force）")
+        except Exception as e2:
+            logger.warning(f"force 点击也失败: {e2}")
+            try:
+                # 方式3：JS 点击
+                start_btn.first.evaluate("el => el.click()")
+                start_clicked = True
+                logger.info("Start 按钮已点击（方式3: JS）")
+            except Exception as e3:
+                logger.error(f"所有点击方式都失败: {e3}")
+
+    if not start_clicked:
+        logger.error("无法点击 Start 按钮")
+        return "offline"
+
+    # 点击后等待一下，确认按钮状态变化
+    page.wait_for_timeout(2000)
+    try:
+        start_btn2, _, _ = find_start_button(page)
+        if start_btn2 and not is_clickable(start_btn2):
+            logger.info("Start 按钮已变为不可点击，说明启动指令已发出")
+        else:
+            logger.warning("Start 按钮仍然可点击，可能需要确认弹窗")
+            # 尝试点击确认按钮
+            confirm_btn = page.get_by_role("button").filter(has_text="Confirm")
+            if confirm_btn.count() > 0 and confirm_btn.first.is_visible():
+                logger.info("检测到确认弹窗，点击确认")
+                try:
+                    confirm_btn.first.click()
+                except Exception:
+                    pass
     except Exception:
-        start_btn.first.click(force=True)
+        pass
 
     logger.info(f"等待服务器上线中（最长 {START_WAIT_TIMEOUT}s）")
     deadline = time.time() + START_WAIT_TIMEOUT
@@ -393,7 +495,7 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
             break
 
         if any("Done (" in line and "For help" in line for line in console_lines):
-            logger.info("控制台检测到服务器启动完成 'Done ... For help'")
+            logger.info("控制台检测到服务器启动完成")
             detected = True
             break
 
@@ -421,11 +523,12 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
 
     if detected:
         logger.info("服务器已成功上线")
+        return "started"
     else:
         logger.warning(f"等待超时（{START_WAIT_TIMEOUT}s）")
 
+    # 最终验证：刷新页面再检查一次
     page.wait_for_timeout(STEP_WAIT)
-
     try:
         page.reload(wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(STEP_WAIT)
@@ -436,17 +539,12 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
         logger.info("最终验证：服务器已在线")
         return "started"
 
-    stop_status = check_stop_button(page)
-    if stop_status == "clickable":
-        logger.info("验证成功：stop 按钮可点击")
-        return "started"
-
     logger.warning("验证未通过：服务器仍未上线")
     return "offline"
 
 
 def check_stop_button(page: Page) -> str:
-    stop_btn, sel, txt = find_button_by_text(page, ["Stop", "Остановить", "Power Off"])
+    stop_btn, sel, txt = find_stop_button(page)
     if not stop_btn:
         logger.info("未找到 stop 按钮")
         return "not_found"
