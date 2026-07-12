@@ -283,27 +283,71 @@ def find_stop_button(page: Page):
 
 
 def check_server_online(page: Page) -> bool:
-    """检测服务器是否在线：检查页面文本和按钮状态"""
+    """检测服务器是否在线：
+    1. 页面显示 Online 状态文字
+    2. Start 按钮不可点击（说明已启动）
+    3. Stop 按钮可点击（说明正在运行）
+    """
     try:
-        # 方式1：检查页面文本
+        # 方式1：检查状态标签是否显示 Online
         body_text = (page.locator("body").text_content() or "").lower()
-        if "online" in body_text or "запущен" in body_text:
+        if "online" in body_text and "offline" not in body_text:
             return True
 
-        # 方式2：检查 Stop 按钮是否存在（服务器在线时才会有 Stop 按钮）
+        # 方式2：Start 按钮不可点击 + 显示 Offline 状态 = 离线
+        # 方式3：Start 按钮不可点击 + 显示 Online 状态 = 在线
+        start_btn, _, _ = find_start_button(page)
         stop_btn, _, _ = find_stop_button(page)
-        if stop_btn:
-            return True
-    except Exception:
-        pass
+
+        if start_btn and stop_btn:
+            start_clickable = is_clickable(start_btn)
+            stop_clickable = is_clickable(stop_btn)
+            logger.info(f"状态判定: Start可点击={start_clickable}, Stop可点击={stop_clickable}")
+
+            # 在线：Start不可点击 + Stop可点击
+            if not start_clickable and stop_clickable:
+                return True
+
+            # 离线：Start可点击 + Stop不可点击
+            if start_clickable and not stop_clickable:
+                return False
+
+        # 方式4：兜底 - 如果明确显示 online 且没有 offline
+        # 注意：页面可能同时包含 online 和 offline（比如控制台日志），所以需要更精确
+        status_bar = page.locator('[class*="InformationBar"], [class*="status"], [class*="Status"]')
+        count = status_bar.count()
+        for i in range(count):
+            text = (status_bar.nth(i).text_content() or "").strip().lower()
+            if text == "online" or text == "запущен":
+                return True
+            if text == "offline" or text == "выключен":
+                return False
+    except Exception as e:
+        logger.warning(f"check_server_online 异常: {e}")
     return False
 
 
 def check_server_offline(page: Page) -> bool:
-    """检测服务器是否离线"""
+    """检测服务器是否离线：
+    Start 按钮可点击 + Stop 按钮不可点击
+    """
     try:
+        start_btn, _, _ = find_start_button(page)
+        stop_btn, _, _ = find_stop_button(page)
+
+        if start_btn and stop_btn:
+            start_clickable = is_clickable(start_btn)
+            stop_clickable = is_clickable(stop_btn)
+            # 离线：Start可点击 + Stop不可点击
+            if start_clickable and not stop_clickable:
+                return True
+            # 在线：Start不可点击 + Stop可点击
+            if not start_clickable and stop_clickable:
+                return False
+
+        # 兜底：检查 Offline 文字
         body_text = (page.locator("body").text_content() or "").lower()
-        if "offline" in body_text or "выключен" in body_text:
+        if "offline" in body_text and "online" not in body_text:
             return True
     except Exception:
         pass
