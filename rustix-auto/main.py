@@ -284,20 +284,19 @@ def find_stop_button(page: Page):
 
 def check_server_online(page: Page) -> bool:
     """检测服务器是否在线：
-    1. 精确匹配服务器卡片上的 Online 状态标签（text-success-50）
-    2. Start 按钮不可点击 + Stop 按钮可点击
+    优先使用精确的状态标签（绿色 Online），按钮组合仅作为参考
     """
     try:
-        # 方式1：精确匹配服务器卡片上的 Online 状态标签
+        # 方式1：精确匹配绿色 Online 状态标签（最可靠）
         status_spans = page.locator("span.text-success-50, span[class*='text-success']")
         count = status_spans.count()
         for i in range(count):
             text = (status_spans.nth(i).text_content() or "").strip().lower()
             if text == "online" or text == "запущен":
-                logger.info(f"检测到精确状态标签: Online")
+                logger.info(f"检测到精确状态标签: Online (绿色)")
                 return True
 
-        # 方式2：精确匹配 ServerCardGradient 状态标签
+        # 方式2：精确匹配 ServerCardGradient 绿色状态
         card_spans = page.locator("span[class*='ServerCardGradient']")
         count = card_spans.count()
         for i in range(count):
@@ -306,29 +305,28 @@ def check_server_online(page: Page) -> bool:
                 logger.info(f"检测到 ServerCardGradient 状态: Online")
                 return True
 
-        # 方式3：Start/Stop 按钮组合判断
+        # 方式3：InformationBar 绿色状态标签（控制台页面）
+        info_spans = page.locator('[class*="InformationBar"]')
+        count = info_spans.count()
+        for i in range(count):
+            text = (info_spans.nth(i).text_content() or "").strip().lower()
+            if text == "online" or text == "запущен":
+                logger.info(f"检测到 InformationBar 状态: Online")
+                return True
+
+        # 方式4：按钮组合判断（控制台页面，作为辅助参考，优先级最低）
+        # 注意：点击Start后按钮状态可能立即变化，但不代表服务器真的启动了
         start_btn, _, _ = find_start_button(page)
         stop_btn, _, _ = find_stop_button(page)
 
         if start_btn and stop_btn:
             start_clickable = is_clickable(start_btn)
             stop_clickable = is_clickable(stop_btn)
-            logger.info(f"状态判定: Start可点击={start_clickable}, Stop可点击={stop_clickable}")
-
-            if not start_clickable and stop_clickable:
-                return True
+            # 不使用按钮组合作为 Online 的判断依据，太不可靠
+            # 只用来判断离线状态
             if start_clickable and not stop_clickable:
                 return False
 
-        # 方式4：兜底 - 检查 InformationBar 状态标签
-        info_spans = page.locator('[class*="InformationBar"]')
-        count = info_spans.count()
-        for i in range(count):
-            text = (info_spans.nth(i).text_content() or "").strip().lower()
-            if text == "online" or text == "запущен":
-                return True
-            if text == "offline" or text == "выключен":
-                return False
     except Exception as e:
         logger.warning(f"check_server_online 异常: {e}")
     return False
@@ -506,6 +504,19 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
 
     page.wait_for_timeout(STEP_WAIT)
 
+    # 在控制台页面，使用按钮组合判断初始状态（因为控制台的状态标签样式不同）
+    start_btn_initial, _, _ = find_start_button(page)
+    stop_btn_initial, _, _ = find_stop_button(page)
+    if start_btn_initial and stop_btn_initial:
+        s_click = is_clickable(start_btn_initial)
+        st_click = is_clickable(stop_btn_initial)
+        logger.info(f"初始状态: Start可点击={s_click}, Stop可点击={st_click}")
+        if not s_click and st_click:
+            logger.info("服务器已处于 Online 状态，无需启动")
+            return "online"
+        if s_click and not st_click:
+            logger.info("检测到服务器处于 Offline 状态")
+
     if check_server_online(page):
         logger.info("服务器已处于 Online 状态，无需启动")
         return "online"
@@ -534,21 +545,18 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
     
     start_clicked = False
     try:
-        # 方式1：普通点击
         start_btn.click()
         start_clicked = True
         logger.info("Start 按钮已点击（方式1）")
     except Exception as e:
         logger.warning(f"普通点击失败: {e}")
         try:
-            # 方式2：force 点击
             start_btn.first.click(force=True)
             start_clicked = True
             logger.info("Start 按钮已点击（方式2: force）")
         except Exception as e2:
             logger.warning(f"force 点击也失败: {e2}")
             try:
-                # 方式3：JS 点击
                 start_btn.first.evaluate("el => el.click()")
                 start_clicked = True
                 logger.info("Start 按钮已点击（方式3: JS）")
@@ -559,49 +567,63 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
         logger.error("无法点击 Start 按钮")
         return "offline"
 
-    # 点击后等待一下，确认按钮状态变化
-    page.wait_for_timeout(2000)
-    try:
-        start_btn2, _, _ = find_start_button(page)
-        if start_btn2 and not is_clickable(start_btn2):
-            logger.info("Start 按钮已变为不可点击，说明启动指令已发出")
-        else:
-            logger.warning("Start 按钮仍然可点击，可能需要确认弹窗")
-            # 尝试点击确认按钮
-            confirm_btn = page.get_by_role("button").filter(has_text="Confirm")
-            if confirm_btn.count() > 0 and confirm_btn.first.is_visible():
-                logger.info("检测到确认弹窗，点击确认")
-                try:
-                    confirm_btn.first.click()
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    # 点击后等待一下，确认启动指令已发出
+    page.wait_for_timeout(3000)
+    logger.info("启动指令已发出，跳转到总览页面监控服务器状态...")
+
+    # 立即跳转到总览页面，通过服务器卡片状态来监控启动进度
+    page.goto(HOME_URL, wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_timeout(3000)
 
     logger.info(f"等待服务器上线中（最长 {START_WAIT_TIMEOUT}s）")
     deadline = time.time() + START_WAIT_TIMEOUT
     detected = False
     last_refresh = time.time()
+    starting_detected = False
 
     while time.time() < deadline:
-        if any("Server marked as running" in line for line in console_lines):
-            logger.info("控制台检测到 'Server marked as running'")
-            detected = True
+        # 检查控制台日志（通过回到控制台页面？不，我们在总览页面监控）
+        # 主要通过服务器卡片状态来判断
+
+        # 方式1：检测绿色 Online 状态（成功）
+        status_spans = page.locator("span.text-success-50, span[class*='text-success']")
+        count = status_spans.count()
+        for i in range(count):
+            text = (status_spans.nth(i).text_content() or "").strip().lower()
+            if text == "online" or text == "запущен":
+                logger.info("总览页面检测到绿色 Online 状态，服务器启动成功！")
+                detected = True
+                break
+        if detected:
             break
 
-        if any("Done (" in line and "For help" in line for line in console_lines):
-            logger.info("控制台检测到服务器启动完成")
-            detected = True
+        # 方式2：检测黄色 Starting 状态（启动中）
+        if not starting_detected:
+            yellow_spans = page.locator("span.text-yellow-50, span[class*='text-yellow']")
+            count = yellow_spans.count()
+            for i in range(count):
+                text = (yellow_spans.nth(i).text_content() or "").strip().lower()
+                if "start" in text or "запуск" in text:
+                    logger.info(f"总览页面检测到启动中状态: {text}")
+                    starting_detected = True
+                    break
+
+        # 方式3：ServerCardGradient 状态标签
+        card_spans = page.locator("span[class*='ServerCardGradient']")
+        count = card_spans.count()
+        for i in range(count):
+            text = (card_spans.nth(i).text_content() or "").strip().lower()
+            if text == "online" or text == "запущен":
+                logger.info("ServerCardGradient 检测到 Online，服务器启动成功！")
+                detected = True
+                break
+        if detected:
             break
 
-        if check_server_online(page):
-            logger.info("检测到页面状态已变更为 Online")
-            detected = True
-            break
-
+        # 定期刷新页面
         if time.time() - last_refresh >= 10:
             elapsed = int(time.time() - (deadline - START_WAIT_TIMEOUT))
-            logger.info(f"已等待 {elapsed}s，刷新页面检查状态...")
+            logger.info(f"已等待 {elapsed}s，刷新总览页面检查状态...")
             try:
                 page.reload(wait_until="domcontentloaded", timeout=30000)
                 page.wait_for_timeout(2000)
@@ -609,42 +631,31 @@ def start_server(page: Page, console_lines: list, email: str) -> str:
                 logger.warning(f"刷新异常: {e}")
             last_refresh = time.time()
 
-            if check_server_online(page):
-                logger.info("刷新后检测到服务器已上线")
-                detected = True
-                break
-
-            # 额外检查：跳转到总览页面验证服务器卡片状态
-            if elapsed > 60:
-                logger.info("额外验证：跳转到总览页面检查服务器卡片状态...")
-                if check_dashboard_online(page):
-                    logger.info("总览页面确认服务器已在线")
-                    detected = True
-                    break
-                # 回到控制台页面继续等待
-                console_url = get_server_console_url()
-                page.goto(console_url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(2000)
-
         page.wait_for_timeout(3000)
 
     if detected:
-        logger.info("服务器已成功上线")
+        logger.info("服务器已成功上线（总览页面确认）")
+        # 回到控制台页面
+        console_url = get_server_console_url()
+        page.goto(console_url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(STEP_WAIT)
         return "started"
     else:
-        logger.warning(f"等待超时（{START_WAIT_TIMEOUT}s）")
+        logger.warning(f"等待超时（{START_WAIT_TIMEOUT}s），服务器未能上线")
 
-    # 最终验证：刷新页面再检查一次
+    # 最终验证：回到控制台页面再检查一次
+    console_url = get_server_console_url()
+    page.goto(console_url, wait_until="domcontentloaded", timeout=30000)
     page.wait_for_timeout(STEP_WAIT)
-    try:
-        page.reload(wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(STEP_WAIT)
-    except Exception:
-        pass
 
-    if check_server_online(page):
-        logger.info("最终验证：服务器已在线")
-        return "started"
+    # 检查控制台页面是否有绿色 Online 状态
+    info_spans = page.locator('[class*="InformationBar"]')
+    count = info_spans.count()
+    for i in range(count):
+        text = (info_spans.nth(i).text_content() or "").strip().lower()
+        if text == "online" or text == "запущен":
+            logger.info("控制台页面确认服务器已在线")
+            return "started"
 
     logger.warning("验证未通过：服务器仍未上线")
     return "offline"
