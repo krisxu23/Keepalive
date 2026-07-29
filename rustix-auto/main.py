@@ -507,20 +507,34 @@ def do_login(page: Page, email: str, password: str) -> bool:
             logger.error("登录页重试仍失败")
             return False
 
-    # 智能等待：等表单元素出现
-    if not smart_wait_for_elements(page, [
+    # 智能等待：等表单元素出现（选择器尽可能全面）
+    FORM_SELECTORS = [
         'input[name="username"]', 'input[type="email"]', 'input[name="email"]',
         'input[type="password"]', 'input[name="password"]',
-    ], timeout=SMART_WAIT):
+        'input:not([type="hidden"]):not([type="submit"])',
+    ]
+    if not smart_wait_for_elements(page, FORM_SELECTORS, timeout=30000):
+        # 记录当前页面状态帮助排查
+        logger.warning(f"当前 URL: {page.url}")
+        logger.warning(f"页面标题: {page.title()}")
+        try:
+            body_text = page.inner_text("body") or ""
+            logger.warning(f"页面内容前500字: {body_text[:500]}")
+        except Exception:
+            pass
         save_debug_screenshot(page, "login_no_form")
         logger.error("登录页未找到表单元素")
         return False
 
+    # 扩充选择器：兼容各种 HTML 结构
     email_loc, _ = find_first_visible(page, [
-        'input[name="username"]', 'input[type="email"]', 'input[name="email"]'
+        'input[name="username"]', 'input[type="email"]', 'input[name="email"]',
+        'input[placeholder*="mail"]', 'input[placeholder*="user"]',
+        'input[autocomplete="username"]', 'input[autocomplete="email"]',
     ])
     pwd_loc, _ = find_first_visible(page, [
-        'input[type="password"]', 'input[name="password"]'
+        'input[type="password"]', 'input[name="password"]',
+        'input[autocomplete="current-password"]',
     ])
 
     if not email_loc or not pwd_loc:
@@ -949,7 +963,7 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
                     if "/auth/login" not in page.url:
                         # 再次检查
                         manage, _, _ = find_button_by_text(page, ["Manage Server", "Manage", "Управление"])
-                        server_link, _, _ = find_first_visible(page, ['a[href*="/server/"][href*="/console"]'])
+                        server_link, _ = find_first_visible(page, ['a[href*="/server/"][href*="/console"]'])
                         if server_link or manage:
                             logger.info("Cookie 验证成功！")
                             cookie_login_success = True
