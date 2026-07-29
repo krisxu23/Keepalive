@@ -939,7 +939,7 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
                                 }
                                 return null;
                             }""",
-                            timeout=DASHBOARD_LOAD_WAIT,
+                            timeout=SMART_WAIT,
                         )
                     except PWTimeout:
                         logger.warning("Cookie 登录：等待页面元素超时")
@@ -975,7 +975,7 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
             # 智能等待服务器列表
             smart_wait_for_elements(page, [
                 'a[href*="/server/"][href*="/console"]',
-            ], timeout=DASHBOARD_LOAD_WAIT)
+            ], timeout=SMART_WAIT)
             page.wait_for_timeout(STEP_SHORT)
 
         logger.info("已成功登录主面板！")
