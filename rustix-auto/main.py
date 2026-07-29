@@ -1047,8 +1047,120 @@ def main():
     if notify.tg_enabled():
         notify.notify_summary(results)
 
+    # 清理旧的 workflow 运行记录
+    try:
+        cleanup_old_workflow_runs(keep_runs=50)
+    except Exception as e:
+        logger.warning(f"workflow 清理异常: {e}")
+
     sys.exit(0 if ok == len(results) and ok > 0 else 1)
 
+
+
+# ─── GitHub Workflow Runs 清理 ──────────────────────────────
+
+def cleanup_old_workflow_runs(keep_runs: int = 50):
+    """
+    清理当前仓库中所有 workflow 的旧运行记录。
+    每个 workflow 保留最近 keep_runs 条，其余全部删除。
+    
+    通过 GitHub REST API 操作，需要 GITHUB_REPOSITORY 和 GH_TOKEN 环境变量。
+    仅在 GitHub Actions 环境中运行（非 Actions 环境自动跳过）。
+    """
+    gh_token = os.environ.get("GH_TOKEN", "").strip()
+    repo_full_name = os.environ.get("GITHUB_REPOSITORY", "").strip()
+
+    if not gh_token or not repo_full_name:
+        logger.info("未检测到 GH_TOKEN 或 GITHUB_REPOSITORY，跳过 workflow 清理")
+        return
+
+    api_base = f"https://api.github.com/repos/{repo_full_name}"
+    headers = {
+        "Authorization": f"token {gh_token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    logger.info("========== 开始清理旧 Workflow 运行记录 ==========")
+
+    try:
+        resp = requests.get(f"{api_base}/actions/workflows", headers=headers, timeout=15)
+        if resp.status_code != 200:
+            logger.warning(f"获取 workflows 失败: {resp.status_code}")
+            return
+        workflows = resp.json().get("workflows", [])
+        logger.info(f"仓库共 {len(workflows)} 个 workflow")
+    except Exception as e:
+        logger.warning(f"获取 workflows 异常: {e}")
+        return
+
+    total_deleted = 0
+    total_failed = 0
+
+    for wf in workflows:
+        wf_id = wf.get("id")
+        wf_name = wf.get("name", "unknown")
+        wf_state = wf.get("state", "unknown")
+
+        if not wf_id:
+            continue
+
+        if wf_state != "active":
+            logger.info(f"  跳过未启用的 workflow: {wf_name} ({wf_state})")
+            continue
+
+        try:
+            page = 1
+            all_run_ids = []
+            while True:
+                runs_resp = requests.get(
+                    f"{api_base}/actions/workflows/{wf_id}/runs",
+                    headers=headers,
+                    params={"per_page": 100, "page": page, "status": "completed"},
+                    timeout=15,
+                )
+                if runs_resp.status_code != 200:
+                    break
+                runs_data = runs_resp.json()
+                runs = runs_data.get("workflow_runs", [])
+                if not runs:
+                    break
+                for r in runs:
+                    all_run_ids.append(r.get("id"))
+                if len(runs) < 100:
+                    break
+                page += 1
+
+            if len(all_run_ids) <= keep_runs:
+                logger.info(f"  ✓ {wf_name}: {len(all_run_ids)} 条记录，无需清理")
+                continue
+
+            to_delete = all_run_ids[keep_runs:]
+            logger.info(f"  🗑 {wf_name}: 共 {len(all_run_ids)} 条，保留 {keep_runs} 条，删除 {len(to_delete)} 条")
+
+            deleted = 0
+            for run_id in to_delete:
+                try:
+                    del_resp = requests.delete(
+                        f"{api_base}/actions/runs/{run_id}",
+                        headers=headers,
+                        timeout=10,
+                    )
+                    if del_resp.status_code in (204, 200):
+                        deleted += 1
+                    else:
+                        total_failed += 1
+                except Exception:
+                    total_failed += 1
+                time.sleep(0.3)
+
+            total_deleted += deleted
+            logger.info(f"    已删除 {deleted}/{len(to_delete)} 条")
+
+        except Exception as e:
+            logger.warning(f"  清理 {wf_name} 时异常: {e}")
+            total_failed += 1
+
+    logger.info(f"========== Workflow 清理完成: 删除 {total_deleted} 条, 失败 {total_failed} 条 ==========")
 
 if __name__ == "__main__":
     main()
