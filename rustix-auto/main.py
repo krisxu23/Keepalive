@@ -569,7 +569,7 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
 
 
 # ---------------- Workflow 清理 ----------------
-def cleanup_old_workflow_runs(keep_runs: int = 50):
+def cleanup_old_workflow_runs(keep_runs: int = 1):
     gh_token = os.environ.get("GH_TOKEN", "").strip()
     repo_full_name = os.environ.get("GITHUB_REPOSITORY", "").strip()
 
@@ -703,7 +703,7 @@ def main():
         notify.notify_summary(results)
 
     try:
-        cleanup_old_workflow_runs(keep_runs=50)
+        cleanup_old_workflow_runs(keep_runs=1)
     except Exception as e:
         logger.warning(f"workflow 清理异常: {e}")
 
