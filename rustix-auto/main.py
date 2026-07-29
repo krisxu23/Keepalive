@@ -39,7 +39,7 @@ logger = logging.getLogger("rustix-auto")
 
 LOGIN_URL = "https://my.rustix.me/auth/login"
 HOME_URL = "https://my.rustix.me"
-START_WAIT_TIMEOUT = 120
+START_WAIT_TIMEOUT = 180
 STEP_WAIT = 3000
 LOGIN_PAGE_WAIT = 6000
 
@@ -419,31 +419,71 @@ def start_server(page: Page, console_lines: list) -> str:
     except Exception:
         start_btn.first.click(force=True)
 
-    logger.info(f"等待控制台输出 'Running Done!'（最长 {START_WAIT_TIMEOUT}s）")
+    # 策略：先等 Running Done!，同时轮询页面状态，两者任一成功即可
+    logger.info(f"等待服务器启动（最长 {START_WAIT_TIMEOUT}s）")
     deadline = time.time() + START_WAIT_TIMEOUT
     detected = False
     while time.time() < deadline:
+        # 方法1：检查控制台日志
         if any("Running Done!" in line for line in console_lines):
             detected = True
+            logger.info("检测到控制台 'Running Done!'")
             break
+
+        # 方法2：检查页面文本
         try:
             if page.locator(":text('Running Done!')").count() > 0:
                 detected = True
+                logger.info("检测到页面 'Running Done!' 文本")
                 break
         except Exception:
             pass
-        page.wait_for_timeout(2000)
+
+        # 方法3：检查 start 按钮变回不可点击 + stop 按钮可点击
+        try:
+            s_btn, _, _ = find_start_button(page)
+            st_btn, _, _ = find_stop_button(page)
+            if s_btn and st_btn:
+                if not is_clickable(s_btn) and is_clickable(st_btn):
+                    detected = True
+                    logger.info("检测到状态变化: start 不可点击 + stop 可点击")
+                    break
+        except Exception:
+            pass
+
+        # 方法4：检查页面上是否出现 Online 状态文本
+        try:
+            body_text = (page.inner_text("body") or "").lower()
+            if "online" in body_text and ("status" in body_text or "состояние" in body_text):
+                # 进一步确认不是残留文本
+                if check_server_online(page):
+                    detected = True
+                    logger.info("检测到 Online 状态文本")
+                    break
+        except Exception:
+            pass
+
+        page.wait_for_timeout(3000)
 
     if detected:
-        logger.info("已检测到 'Running Done!'，服务器上线中")
+        logger.info("服务器启动成功")
     else:
-        logger.warning("等待超时，未检测到 'Running Done!'，继续验证 stop 状态")
+        logger.warning(f"等待 {START_WAIT_TIMEOUT}s 超时，尝试最终验证")
 
+    # 最终验证：等几秒后再次检查 stop 按钮
     page.wait_for_timeout(STEP_WAIT)
     if check_stop_button(page) == "clickable":
         logger.info("验证成功：stop 按钮可点击，服务器已上线")
         return "started"
-    logger.warning("验证未通过：stop 按钮不可点击")
+
+    # 再等一次，给服务器更多时间
+    logger.info("再次等待 30 秒后验证...")
+    page.wait_for_timeout(30000)
+    if check_stop_button(page) == "clickable":
+        logger.info("延迟验证成功：服务器已上线")
+        return "started"
+
+    logger.warning("验证未通过：服务器可能仍在启动中")
     return "offline"
 
 
