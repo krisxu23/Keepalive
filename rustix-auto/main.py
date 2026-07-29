@@ -532,47 +532,54 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
         page.on("console", on_console)
         page.on("pageerror", lambda err: logger.warning(f"[pageerror] {err}"))
 
-        # === 尝试 Cookie 登录 ===
-        cookies = load_cookies_for_account(email)
-        cookie_login_success = False
-
-        if cookies:
-            logger.info("检测到 RUSTIX_COOKIE，尝试 Cookie 登录...")
-            try:
-                for c in cookies:
-                    if "domain" not in c:
-                        c["domain"] = "my.rustix.me"
-                context.add_cookies(cookies)
-                page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(6000)
-
-                if "/auth/login" not in page.url:
-                    server_link, _ = find_first_visible(page, ['a[href*="/server/"][href*="/console"]'])
-                    manage_btn, _, _ = find_button_by_text(page, ["Manage Server", "Manage", "Управление"])
-                    if server_link or manage_btn:
-                        logger.info("Cookie 验证成功！")
-                        cookie_login_success = True
-                    else:
-                        logger.warning("Cookie 登录验证未通过（无服务器元素）")
-                else:
-                    logger.warning("Cookie 已过期，被重定向到登录页")
-                    logger.info("提示: Cookie 过期，请更新 RUSTIX_COOKIE Secret")
-
-            except Exception as e:
-                logger.warning(f"Cookie 登录异常，切换密码登录: {e}")
-
-        # === 密码登录 ===
-        if not cookie_login_success:
-            logger.info("尝试账号密码登录...")
-            if not do_login(page, email, password):
-                result["error"] = "登录失败"
-                return result
+        # === 第一选择：账号密码登录 ===
+        password_login_success = False
+        logger.info("尝试账号密码登录（第一选择）...")
+        if do_login(page, email, password):
+            password_login_success = True
+            # 登录成功后立即更新 Cookie 到 GitHub Secrets
+            logger.info("登录成功，正在更新 RUSTIX_COOKIE...")
             save_cookies(context)
+        else:
+            logger.warning("密码登录失败")
+
+        # === 第二选择：Cookie 登录（密码失败时降级） ===
+        cookie_login_success = False
+        if not password_login_success:
+            cookies = load_cookies_for_account(email)
+            if cookies:
+                logger.info("密码登录失败，降级尝试 Cookie 登录...")
+                try:
+                    for c in cookies:
+                        if "domain" not in c:
+                            c["domain"] = "my.rustix.me"
+                    context.add_cookies(cookies)
+                    page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
+                    page.wait_for_timeout(6000)
+
+                    if "/auth/login" not in page.url:
+                        server_link, _ = find_first_visible(page, ['a[href*="/server/"][href*="/console"]'])
+                        manage_btn, _, _ = find_button_by_text(page, ["Manage Server", "Manage", "Управление"])
+                        if server_link or manage_btn:
+                            logger.info("Cookie 验证成功！")
+                            cookie_login_success = True
+                        else:
+                            logger.warning("Cookie 登录验证未通过（无服务器元素）")
+                    else:
+                        logger.warning("Cookie 已过期，被重定向到登录页")
+                except Exception as e:
+                    logger.warning(f"Cookie 登录异常: {e}")
+
+        if not password_login_success and not cookie_login_success:
+            result["error"] = "密码登录和 Cookie 登录均失败"
+            return result
 
         # === 导航到服务器管理页面 ===
         if cookie_login_success and navigate_to_console(page):
+            # Cookie 降级登录 + 直接跳转控制台
             status = start_server(page, console_lines)
         else:
+            # 标准流程：Manage Server -> 控制台
             if not click_manage_server(page):
                 result["error"] = "未找到 Manage Server"
                 return result
