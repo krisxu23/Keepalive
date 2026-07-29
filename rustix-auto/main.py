@@ -199,7 +199,27 @@ def find_first_visible(page: Page, selectors):
                 return loc, sel
         except Exception:
             continue
+    # 降级：用 Playwright 的 getByPlaceholder / getByRole 直接查找
+    placeholders = {
+        "почта": ("placeholder", "почта"),
+        "username": ("placeholder", "username"),
+        "email": ("placeholder", "email"),
+        "password": ("placeholder", "password"),
+        "пароль": ("placeholder", "пароль"),
+    }
     return None, None
+
+
+def find_input_by_placeholder(page: Page, keywords: list):
+    """通过 placeholder 关键词查找输入框，支持俄语/英语。"""
+    for kw in keywords:
+        try:
+            loc = page.get_by_placeholder(kw, exact=False).first
+            if loc.count() > 0 and loc.is_visible():
+                return loc
+        except Exception:
+            continue
+    return None
 
 
 def find_button_by_text(page: Page, texts):
@@ -264,17 +284,24 @@ def do_login(page: Page, email: str, password: str) -> bool:
 
     page.wait_for_timeout(LOGIN_PAGE_WAIT)
 
-    email_loc, email_sel = find_first_visible(page, [
-        'input[name="username"]',
-        'input[type="email"]',
-        'input[name="email"]',
-        'input[autocomplete="username"]',
-    ])
-    pwd_loc, pwd_sel = find_first_visible(page, [
-        'input[type="password"]',
-        'input[name="password"]',
-        'input[autocomplete="current-password"]',
-    ])
+    # 优先用 placeholder 查找（Rustix 登录框是俄语 placeholder）
+    email_loc = find_input_by_placeholder(page, ["почта", "username", "email", "user"])
+    pwd_loc = find_input_by_placeholder(page, ["пароль", "password"])
+
+    # 降级用 CSS 选择器
+    if not email_loc:
+        email_loc, email_sel = find_first_visible(page, [
+            'input[name="username"]',
+            'input[type="email"]',
+            'input[name="email"]',
+            'input[autocomplete="username"]',
+        ])
+    if not pwd_loc:
+        pwd_loc, pwd_sel = find_first_visible(page, [
+            'input[type="password"]',
+            'input[name="password"]',
+            'input[autocomplete="current-password"]',
+        ])
 
     if not email_loc or not pwd_loc:
         page.screenshot(path=f"debug_login_{int(time.time())}.png")
