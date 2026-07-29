@@ -415,7 +415,7 @@ def start_server(page: Page, console_lines: list) -> str:
 
     logger.info("服务器离线，点击 start 启动")
     try:
-        start_btn.click()
+        start_btn.click(force=True)
     except Exception:
         start_btn.first.click(force=True)
 
