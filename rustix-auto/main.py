@@ -297,13 +297,54 @@ def get_current_ip() -> str:
     return resp.text.strip()
 
 
+def safe_screenshot(page: Page, name: str):
+    """调试截图的安全封装：短超时 + 禁用动画 + 失败仅警告。
+
+    页面卡在加载/动画中时 Playwright 截图会默认等 30s 甚至超时抛异常，
+    把调试手段变成流程崩溃点。这里限时 8s 且吞掉异常。
+    """
+    try:
+        page.screenshot(path=name, timeout=8000, animations="disabled")
+    except Exception as e:
+        logger.warning(f"截图失败（跳过）: {e}")
+
+
+def check_site_reachable(timeout: int = 20) -> bool:
+    """通过当前网络路径（代理或直连）探测 my.rustix.me 是否可达。
+
+    返回 True 表示 TCP/TLS/HTTP 握手已完成（HTTP 4xx 也算可达，可能是
+    WAF 挑战页）；超时/连接失败返回 False，说明当前出口 IP 大概率被
+    Mitelis 拦截，继续走浏览器流程只会白等 60s 再崩，不如快速失败。
+    """
+    proxies = None
+    if IS_PROXY:
+        proxies = {"http": PROXY_SERVER, "https": PROXY_SERVER}
+    try:
+        start = time.time()
+        resp = requests.get(
+            LOGIN_URL, proxies=proxies, timeout=timeout, allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        )
+        elapsed = time.time() - start
+        logger.info(f"站点预检: HTTP {resp.status_code} | 耗时 {elapsed:.1f}s | {resp.url[:80]}")
+        return True
+    except Exception as e:
+        logger.error(f"站点预检失败（{timeout}s 内未完成连接）: {e}")
+        return False
+
+
 # ---------------- 登录流程 ----------------
 def do_login(page: Page, email: str, password: str) -> bool:
     logger.info(f"打开登录页: {LOGIN_URL}")
-    try:
-        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-    except PWTimeout:
-        logger.warning("页面加载超时，继续尝试")
+    for attempt in range(2):
+        try:
+            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+            break
+        except PWTimeout:
+            logger.warning(f"页面加载超时（第 {attempt + 1}/2 次），重试...")
+            page.wait_for_timeout(2000)
+    else:
+        logger.warning("页面加载持续超时，继续尝试")
 
     page.wait_for_timeout(LOGIN_PAGE_WAIT)
 
@@ -327,7 +368,7 @@ def do_login(page: Page, email: str, password: str) -> bool:
         ])
 
     if not email_loc or not pwd_loc:
-        page.screenshot(path=f"debug_login_{int(time.time())}.png")
+        safe_screenshot(page, f"debug_login_{int(time.time())}.png")
         logger.error("未找到登录表单（邮箱/密码输入框）")
         return False
 
@@ -345,7 +386,7 @@ def do_login(page: Page, email: str, password: str) -> bool:
         txt = "submit(fallback)"
 
     if not login_btn:
-        page.screenshot(path=f"debug_login_{int(time.time())}.png")
+        safe_screenshot(page, f"debug_login_{int(time.time())}.png")
         logger.error("未找到登录按钮")
         return False
 
@@ -595,6 +636,14 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
 
         page.on("console", on_console)
         page.on("pageerror", lambda err: logger.warning(f"[pageerror] {err}"))
+
+        # === 站点可达性预检（代理/直连）===
+        # my.rustix.me 挂在 Mitelis DDoS 防护后，会拦截/拖死机房 IP：
+        # 预检不通时继续走浏览器只会白等 60s+30s 再崩，直接快速失败并给出明确原因。
+        if not check_site_reachable():
+            result["error"] = "my.rustix.me 不可达（当前出口 IP 被拦截？）。代理模式下请确认节点出口 IP 未被 Mitelis 拦截"
+            logger.error(result["error"])
+            return result
 
         # === 第一选择：账号密码登录 ===
         password_login_success = False

@@ -12,6 +12,7 @@
 - 监听浏览器控制台 `Running Done!` 确认上线，并通过 `stop` 按钮可点击状态验证（**不点击 stop**）
 - **代理节点支持**：配置 `NODE_LINK` 后浏览器流量走节点出口，避开目标站对 GitHub 机房 IP 的拦截
 - 启动时打印 `📍 当前出口 IP`，直观确认节点是否生效
+- 站点可达性预检：启动前 20 秒探测 `my.rustix.me`，不可达时快速失败并提示原因（不再白等 90 秒后崩溃）
 - 完整日志输出 + 文件日志 `run.log`，调试截图 `debug_*.png`
 - Telegram 批量汇总通知（邮箱脱敏）
 - 自动清理旧 workflow 运行记录（保留最近 1 条）
@@ -54,15 +55,19 @@ rustix-auto/
 
 1. workflow 的 `⚙ 设置代理 (sing-box)` 步骤运行 `setup_proxy.sh`（第三方脚本，该步骤仅注入 `NODE_LINK` 一个环境变量）
 2. `NODE_LINK` 非空 → 下载 sing-box → 解析节点 → 本地启动代理（SOCKS5 `127.0.0.1:1080` / HTTP `127.0.0.1:1081`），并把 `IS_PROXY=true`、`PROXY_SERVER=socks5://127.0.0.1:1080` 写入 `GITHUB_ENV`
-3. `main.py` 检测到 `IS_PROXY=true` → 浏览器上下文挂载代理，先请求 `api.ip.sb/ip` 打印当前出口 IP
-4. 之后所有页面访问都经 sing-box → 你的节点 → `my.rustix.me`，目标站看到的出口 IP 为节点 IP
+3. 同一步骤里还会用 curl 分别以「直连」和「代理」两种路径访问 `my.rustix.me`，输出 HTTP 状态码与耗时对比，一眼判断当前出口是否被拦截
+4. `main.py` 检测到 `IS_PROXY=true` → 浏览器上下文挂载代理，先请求 `api.ip.sb/ip` 打印当前出口 IP；随后对 `my.rustix.me` 做 20 秒可达性预检，不通则快速失败并给出明确原因（不再白等 60s+30s）
+5. 之后所有页面访问都经 sing-box → 你的节点 → `my.rustix.me`，目标站看到的出口 IP 为节点 IP
 
 **如何确认生效**：运行日志出现：
 
 ```
 🔗 已启用代理: socks5://127.0.0.1:1080
 📍 当前出口 IP: 1.2.3.4   ← 应为节点 IP，而不是 GitHub 机房 IP
+站点预检: HTTP 200/302 | 耗时 x.xs
 ```
+
+**注意：节点出口 IP 必须不是机房 IP**。机场（订阅）节点的出口绝大多数是数据中心 IP，Mitelis 对机房 IP 一视同仁地拦截——即使挂了代理也会同样超时。此时 workflow 会输出 `代理: 超时/失败（节点出口 IP 可能也被 Mitelis 拦截）`，请换用**住宅/家宽 IP 的节点**（如自建在家里的代理，或提供家宽出口的服务）。
 
 **未配置 `NODE_LINK` 时**：`setup_proxy.sh` 写入 `IS_PROXY=false`，脚本直连，行为与原来完全一致。
 
@@ -172,4 +177,4 @@ IS_PROXY=true PROXY_SERVER=socks5://127.0.0.1:1080 python main.py
 - 调试截图 `debug_*.png` 仅在找不到关键元素时生成，随运行日志一起上传 artifact（保留 7 天）。
 - 若站点页面结构更新导致选择器失效，可在 `find_button_by_text` / `find_first_visible` 中补充选择器。
 - `setup_proxy.sh` 来自第三方域名，该步骤仅接收 `NODE_LINK` 环境变量，其他 Secrets 不会暴露给它；sing-box 本体从 GitHub 官方 releases 下载。
-- 若配置节点后仍失败：先确认日志中 `📍 当前出口 IP` 已变为节点 IP；若已是节点 IP 仍超时，说明问题不在出口 IP，需检查节点本身是否可用/节点 IP 是否干净。
+- 若配置节点后仍失败：先看 workflow 里 `⚙ 设置代理` 步骤的「直连 / 代理」对比测试输出——若代理路径超时/失败，说明节点出口 IP 被 Mitelis 拦截（机场节点多为机房 IP），需换**住宅/家宽 IP** 的节点；若代理测试正常但脚本仍失败，再检查日志中 `📍 当前出口 IP` 与 `站点预检` 输出。
