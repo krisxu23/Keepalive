@@ -206,7 +206,7 @@ def login_with_password(sb, email: str, password: str) -> bool:
         except Exception:
             pass
         try:
-            sb.save_screenshot("debug_login.png")
+            sb.save_screenshot("debug_login.png", timeout=8)
         except Exception:
             pass
         return False
@@ -234,7 +234,7 @@ def login_with_password(sb, email: str, password: str) -> bool:
         sb.sleep(1)
     logger.error("登录后未跳转（密码错误或页面异常）")
     try:
-        sb.save_screenshot("debug_login_failed.png")
+        sb.save_screenshot("debug_login_failed.png", timeout=8)
     except Exception:
         pass
     return False
