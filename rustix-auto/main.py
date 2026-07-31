@@ -43,6 +43,14 @@ START_WAIT_TIMEOUT = 180
 STEP_WAIT = 3000
 LOGIN_PAGE_WAIT = 6000
 
+# ---------------- 代理配置（可选，与 Auto-Renew-Bothosting 相同接口） ----------------
+# IS_PROXY=true 时，浏览器流量走 PROXY_SERVER 指定的代理出口。
+# 在 GitHub Actions 中，setup_proxy.sh 会把节点(NODE_LINK)转成本地 sing-box 代理，
+# 并自动写入 IS_PROXY=true 和 PROXY_SERVER=socks5://127.0.0.1:1080 到 GITHUB_ENV，
+# 后续步骤自动继承，无需手动配置；本地调试时可直接设置环境变量。
+IS_PROXY = os.environ.get("IS_PROXY", "false").strip().lower() == "true"
+PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
+
 
 # ---------------- GitHub Secret 更新 ----------------
 def update_github_secret(secret_name: str, secret_value: str) -> bool:
@@ -272,6 +280,21 @@ def check_server_online(page: Page) -> bool:
     except Exception:
         pass
     return False
+
+
+# ---------------- 出口 IP 检测（验证代理节点是否生效） ----------------
+def get_current_ip() -> str:
+    """通过代理请求 api.ip.sb 获取当前出口 IP，用于确认节点已生效。
+
+    代理不可用/超时等异常会向上抛出，由调用方兜底（仅警告，不中断流程）。
+    注意：GitHub API 相关请求（更新 secret、清理 workflow）不走代理，保持直连。
+    """
+    proxies = None
+    if IS_PROXY:
+        proxies = {"http": PROXY_SERVER, "https": PROXY_SERVER}
+    resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
+    resp.raise_for_status()
+    return resp.text.strip()
 
 
 # ---------------- 登录流程 ----------------
@@ -557,6 +580,7 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36",
             locale="en-US",
+            **({"proxy": {"server": PROXY_SERVER}} if IS_PROXY else {}),
         )
         page = context.new_page()
 
@@ -756,6 +780,17 @@ def main():
     results = []
     if notify.tg_enabled():
         logger.info("已启用 Telegram 通知")
+
+    if IS_PROXY:
+        logger.info(f"🔗 已启用代理: {PROXY_SERVER}")
+        try:
+            ip = get_current_ip()
+            logger.info(f"📍 当前出口 IP: {ip}")
+        except Exception as e:
+            logger.warning(f"⚠️ 获取出口 IP 失败（检查节点是否可用）: {e}")
+    else:
+        logger.info("🍭 未启用代理，直连访问（若目标站拦截机房 IP，请配置 NODE_LINK）")
+
     with sync_playwright() as pw:
         for idx, acc in enumerate(accounts, 1):
             logger.info(f"--- 第 {idx}/{len(accounts)} 个账号 ---")

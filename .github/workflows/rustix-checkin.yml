@@ -48,6 +48,15 @@ jobs:
       - name: 安装 Playwright 浏览器
         run: python -m playwright install --with-deps chromium
 
+      # 配置 NODE_LINK secret（节点链接）后自动在 runner 上起 sing-box 本地代理，
+      # 浏览器流量经节点出口访问 my.rustix.me，避开机房 IP 被 Mitelis 拦截的问题。
+      # 未配置 NODE_LINK 时脚本自动进入直连模式，不影响原有流程。
+      - name: ⚙ 设置代理 (sing-box)
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: |
+          bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
+
       - name: 运行自动启动脚本
         working-directory: rustix-auto
         env:
@@ -58,6 +67,11 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: python main.py
+
+      - name: 🧽 清理 sing-box 进程
+        if: always()
+        run: |
+          pkill -f sing-box || true
 
       - name: 上传运行日志
         if: always()
