@@ -1,181 +1,106 @@
-# Rustix 服务器自动启动
+# Rustix 自动启动保活 (rustix-auto)
 
-自动登录 [my.rustix.me](https://my.rustix.me)，进入 Manage Server，检测并启动服务器，通过浏览器控制台 `Running Done!` 与 stop 按钮状态确认上线。支持多账号轮流操作、Telegram 通知、GitHub Actions 自动运行、代理节点出口。
+Rustix.me（Pterodactyl 面板）服务器自动启动脚本。**Playwright 方案因无法通过 Mitelis 反爬挑战已被淘汰**，现基于 [Auto-Renew-Bothosting](https://github.com/eooce/Auto-Renew-Bothosting) 验证过的 **seleniumbase UC（undetected Chrome）** 方案重写。
 
 ## 功能
 
-- 多账号轮流登录与操作（每个账号独立浏览器上下文）
-- 登录策略：账号密码登录（第一选择）→ Cookie 登录（降级，成功后自动回写 `RUSTIX_COOKIE` Secret）
-- 自动登录 → 点击 `Manage Server` → 判断 `start` 按钮状态
-  - `start` 可点击 → 服务器离线，点击启动
-  - `start` 不可点击 → 服务器已在线，跳过
-- 监听浏览器控制台 `Running Done!` 确认上线，并通过 `stop` 按钮可点击状态验证（**不点击 stop**）
-- **代理节点支持**：配置 `NODE_LINK` 后浏览器流量走节点出口，避开目标站对 GitHub 机房 IP 的拦截
-- 启动时打印 `📍 当前出口 IP`，直观确认节点是否生效
-- 站点可达性预检：启动前 20 秒探测 `my.rustix.me`，不可达时快速失败并提示原因（不再白等 90 秒后崩溃）
-- 完整日志输出 + 文件日志 `run.log`，调试截图 `debug_*.png`
-- Telegram 批量汇总通知（邮箱脱敏）
+- 多账号轮流操作，密码登录优先、Cookie 登录降级
+- 通过 Manage Server → 判断 start 按钮状态 → 点击启动 → 确认上线
+- 上线确认：页面出现 `Running Done!` 或 stop 按钮变为可点击（**不点击 stop**）
+- Telegram 通知（单账号明细 + 汇总，失败才推）
+- 可选代理：配置 `NODE_LINK` 后浏览器流量走节点出口
+- 完整日志 `run.log` + 失败调试截图 `debug_*.png`（workflow artifact 保留 7 天）
 - 自动清理旧 workflow 运行记录（保留最近 1 条）
 
-## 目录结构
+## 为什么需要 UC 浏览器（背景）
+
+`my.rustix.me` 由 **Mitelis DDoS-Mitigation** 防护，其挑战链是：
 
 ```
-.github/workflows/rustix-checkin.yml  # GitHub Actions 工作流
-rustix-auto/
-├── main.py                     # 主脚本
-├── notify.py                   # Telegram 通知组件
-├── requirements.txt            # Python 依赖
-├── .env.example                # 环境变量示例
-└── .gitignore
+第1层: Set-Cookie mit_ck_p1 -> 挑战页（内嵌 token，JS 设 mit_ck_p2 后自动刷新）
+第2层: 带 p1+p2 -> 极简 HTML，内嵌解析阻塞脚本 /FsGtA7wj4k6YkizM?<加密串>
+第3层: 该脚本返回 74KB 混淆 JS（执行证明），检测到自动化痕迹即拖死连接
 ```
 
-## 配置 Secrets
+实测行为：**对非浏览器客户端（curl/requests）秒回 403/挑战页；对带自动化标记的浏览器（无头 Chromium、`navigator.webdriver=true`、UA 与真实版本不符）拖死连接**——`domcontentloaded` 永不触发，页面永远加载中。换代理出口 IP 无效（问题在浏览器指纹，不在 IP）。
 
-在仓库 **Settings → Secrets and variables → Actions → New repository secret** 添加：
+seleniumbase UC 的解法：
+
+- 真实 Chrome + 有头模式（CI 中由 `xvfb-run` 提供虚拟显示），无自动化构建标记
+- 启动时打反检测补丁，隐藏 `navigator.webdriver` 等特征
+- `uc_open_with_reconnect`：检测到挑战时断开并重连 CDP 会话，让挑战误以为浏览器重启，拿到放行 cookie
+
+**本地实测**：UC 浏览器 7 秒通过挑战链，真实登录表单正常渲染，表单提交链路（服务器返回真实凭据校验结果）验证通过。
+
+## 部署
+
+### 1. Secrets
 
 | Secret | 必填 | 说明 |
-|--------|------|------|
-| `RUSTIX_ACCOUNTS` | ✅ | 账号列表，简单格式 `邮箱:密码`，多账号用英文逗号分隔。密码不能包含英文逗号，可以包含冒号（按第一个冒号分割） |
-| `NODE_LINK` | 建议 | 代理节点链接，目标站拦截机房 IP 时必需（见下方「代理节点」） |
-| `TG_BOT_TOKEN` | 可选 | Telegram Bot Token（@BotFather 获取） |
-| `TG_CHAT_ID` | 可选 | 接收通知的 chat id（@userinfobot 获取；群组为负数） |
-| `RUSTIX_COOKIE` | 可选 | 登录 Cookie（JSON）。密码登录成功后自动回写更新，无需手动维护；密码登录不可用时可降级使用 |
-| `RUSTIX_SERVERID` | 可选 | 服务器 ID |
-| `GH_TOKEN` | 可选 | GitHub PAT，用于自动更新 `RUSTIX_COOKIE` Secret 与清理旧 workflow 运行记录 |
+|---|---|---|
+| `RUSTIX_ACCOUNTS` | ✅ | 账号，格式 `email:password,email:password`（密码不能含逗号；按第一个冒号分割） |
+| `RUSTIX_COOKIE` | ❌ | JSON 数组/对象的浏览器 Cookie，密码登录失败时降级使用 |
+| `TG_BOT_TOKEN` | ❌ | Telegram Bot Token（@BotFather），与下项同时配置才推送 |
+| `TG_CHAT_ID` | ❌ | Telegram chat id（@userinfobot 获取；群组 id 为负数） |
+| `NODE_LINK` | ❌ | 节点链接（`vmess:// trojan:// ss:// vless://` 或订阅），配置后走代理出口 |
 
-## 代理节点（绕过 IP 拦截）
+### 2. 触发方式（任选）
 
-**为什么需要**：`my.rustix.me` 挂在 Mitelis DDoS 防护（响应头 `Server: Mitelis DDoS-Mitigation`）后面，会拦截或拖死 GitHub Actions 机房（数据中心）IP 的请求。典型表现：登录页 60 秒加载超时，随后连调试截图都超时崩溃（`Page.screenshot: Timeout 30000ms exceeded`）。
+- **GitHub 定时**：workflow 已内置 `0 */6 * * *` 每 6 小时一次
+- **Uptime Kuma 通知**（推荐，DOWN 时立即触发）：
+  1. Uptime Kuma → 通知 → 新建「Webhook」，URL 填 `https://api.github.com/repos/<用户名>/Keepalive/dispatches`
+  2. 勾选「额外 Header」：`Authorization: Bearer <PAT>`、`Accept: application/vnd.github+json`
+  3. 请求体选「自定义」：`{"event_type": "cloudflare_cron_trigger", "client_payload": {"status": "{{ status }}"}}`
+  4. 在 Rustix 服务器监控项的「通知」处勾选该 Webhook
+  5. 手动 Pause/Resume 一次监控项测试，Actions 页应出现 `rustix-auto-alive` 新 run
 
-**怎么配**：只需要添加一个 Secret：
+> `event_type` 必须为 `cloudflare_cron_trigger`，与 workflow 的 `types: [cloudflare_cron_trigger]` 对应。
 
-- `NODE_LINK`：你的节点分享链接，支持 `vless://`、`vmess://`、`trojan://`、`ss://` 等格式（从机场客户端的「复制节点链接」获取；订阅链接需先提取出单节点）
+## 工作原理
 
-**工作原理**：
-
-1. workflow 的 `⚙ 设置代理 (sing-box)` 步骤运行 `setup_proxy.sh`（第三方脚本，该步骤仅注入 `NODE_LINK` 一个环境变量）
-2. `NODE_LINK` 非空 → 下载 sing-box → 解析节点 → 本地启动代理（SOCKS5 `127.0.0.1:1080` / HTTP `127.0.0.1:1081`），并把 `IS_PROXY=true`、`PROXY_SERVER=socks5://127.0.0.1:1080` 写入 `GITHUB_ENV`
-3. 同一步骤里还会用 curl 分别以「直连」和「代理」两种路径访问 `my.rustix.me`，输出 HTTP 状态码与耗时对比，一眼判断当前出口是否被拦截
-4. `main.py` 以**有头模式 + 真实 Chrome**（xvfb 虚拟显示）启动浏览器，禁用 `AutomationControlled` 特性并隐藏 `navigator.webdriver` 标记——Mitelis 的多层 JS 挑战会检测无头/自动化痕迹，检测到就拖死页面（表现为 `domcontentloaded` 永不触发）
-5. 登录页加载改用 `wait_until="commit"` + 最长 90 秒轮询等待登录表单（挑战页会多次自动刷新，等 `domcontentloaded` 会被打断）
-6. 所有页面访问都经 sing-box → 你的节点 → `my.rustix.me`，目标站看到的出口 IP 为节点 IP
+1. workflow 的 `⚙ 设置代理 (sing-box)` 步骤运行 `setup_proxy.sh`（第三方脚本，该步骤仅注入 `NODE_LINK` 一个环境变量）：`NODE_LINK` 非空 → 下载 sing-box → 解析节点 → 本地启动 SOCKS5 代理 → 写入 `IS_PROXY=true` / `PROXY_SERVER=socks5://127.0.0.1:1080` 到 `GITHUB_ENV`
+2. `main.py` 先做**站点可达性预检**（20 秒内拿到 HTTP 响应即视为可达，403/200 都算），不可达快速失败
+3. UC 浏览器（真实 Chrome + 有头 + 反检测补丁）打开登录页，`uc_open_with_reconnect` 绕过 Mitelis 挑战，轮询等待真实登录表单（最长 60s）
+4. 密码登录优先；失败自动降级 Cookie 登录
+5. 登录后点击 Manage Server → 检查 start 按钮状态：可点击 → 点击并等待 `Running Done!` / stop 按钮可点击（120s）；不可点击 → 已在线上
+6. 结果汇总 + Telegram 通知，最后清理旧 workflow 运行记录
 
 **如何确认生效**：运行日志出现：
 
 ```
-🔗 已启用代理: socks5://127.0.0.1:1080
-📍 当前出口 IP: 1.2.3.4   ← 应为节点 IP，而不是 GitHub 机房 IP
-站点预检: HTTP 200/302 | 耗时 x.xs
+📍 当前出口 IP: ...          （配置了 NODE_LINK 时）
+站点预检: HTTP 200 | 耗时 x.xs
+打开登录页: https://my.rustix.me/auth/login
+等待 Mitelis 挑战通过（最长 60s）...
+填写账号密码... / 点击登录按钮
+✅ 登录成功，跳转至: ...
+✅ 检测到 'Running Done!'    （或 start 不可点击 -> 服务器已在线）
 ```
 
-**注意：节点出口 IP 必须不是机房 IP**。机场（订阅）节点的出口绝大多数是数据中心 IP，Mitelis 对机房 IP 一视同仁地拦截——即使挂了代理也会同样超时。此时 workflow 会输出 `代理: 超时/失败（节点出口 IP 可能也被 Mitelis 拦截）`，请换用**住宅/家宽 IP 的节点**（如自建在家里的代理，或提供家宽出口的服务）。
+## 故障排查
 
-**未配置 `NODE_LINK` 时**：`setup_proxy.sh` 写入 `IS_PROXY=false`，脚本直连，行为与原来完全一致。
+- **`60s 内未出现登录表单`**：挑战未通过。确认 workflow 运行步骤使用了 `xvfb-run` + `python3 main.py`（有头模式）；本地调试勿设 `HEADLESS=true`。
+- **`站点预检失败`**：站点不可达或网络问题；若配置了 `NODE_LINK`，检查日志中 `📍 当前出口 IP` 是否为节点 IP。
+- **`登录后未跳转`**：密码错误（服务器会提示 «Введены неверные данные для входа»），或账号风控（可尝试配置 `NODE_LINK` 换出口）。
+- **`未找到 start 按钮` / `未找到 Manage Server 按钮`**：站点改版，在 `find_button_by_text` 中补充按钮文案（俄语/英语）。
+- **`等待启动确认超时`**：已点击 start 但 120s 内未见上线信号，查看 artifact 的 `run.log` 和 `debug_*.png`。
 
-**本地调试**：本地运行需自己先起好代理，再设置环境变量：
+## 本地运行
 
 ```bash
-IS_PROXY=true PROXY_SERVER=socks5://127.0.0.1:1080 python main.py
+pip install -r requirements.txt
+seleniumbase install chromedriver
+# Windows/Linux 桌面环境直接运行（有头）
+ACCOUNTS="email:password" python main.py
+# Linux 无桌面环境
+ACCOUNTS="email:password" xvfb-run -a python main.py
+# 代理（可选）
+IS_PROXY=true PROXY_SERVER=socks5://127.0.0.1:1080 xvfb-run -a python main.py
 ```
-
-## 通知示例
-
-```
-📊 Rustix 批量执行汇总
-
-🚩 总体: 🎉 全部成功
-⏰ 时间: 2026-06-27 13:46:00
-📈 统计: 共 2 个
-✅ 成功 2 | ❌ 失败 0
-━━━━━━━━━━━━━━━━━━
-账号明细
-1️⃣ *********@example.com
-    ✅ 成功启动
-2️⃣ **********@example.com
-    🟢 已在线
-━━━━━━━━━━━━━━━━━━
-🔗 前往控制台
-```
-
-> 未配置 `TG_BOT_TOKEN` / `TG_CHAT_ID` 时自动跳过通知，不影响主流程。网络异常时仅记录日志，不中断运行。
-
-## GitHub Actions 自动运行
-
-工作流文件：`.github/workflows/rustix-checkin.yml`，触发方式：
-
-| 触发方式 | 说明 | 配置 |
-|----------|------|------|
-| 手动触发 | Actions 页面点 Run workflow | 默认支持，无需配置 |
-| API 触发 | `repository_dispatch`，`event_type` 为 `cloudflare_cron_trigger`（需与 Worker 中配置严格一致） | 由 Cloudflare Worker 定时/事件触发，见下方 |
-
-当前 workflow 为**无条件执行**（每次触发都完整运行）。如需按事件内容过滤（例如只在 Down 时执行），可在 job 上添加 `if` 条件，workflow 内已留有注释示例。
-
-### Cloudflare Worker 触发（推荐）
-
-仓库 `webhook-action/` 下有现成的 Worker 示例（Uptime Kuma → Cloudflare Worker → GitHub `repository_dispatch`）。部署时注意：
-
-1. `event_type` 必须与 workflow 的 `types` 一致（当前为 `cloudflare_cron_trigger`），否则触发无效
-2. Worker 需要 GitHub PAT（`repo` 权限 + Actions read/write），参考 `webhook-action/uptime-webhook.js` 头部的部署说明
-
-### Uptime Kuma 故障触发（可选）
-
-若用 Uptime Kuma 直接触发（不经 Worker）：
-
-#### 1. 创建 GitHub PAT
-
-1. GitHub → Settings → Developer settings → **Personal access tokens** → Fine-grained tokens → Generate new token
-2. 设置：
-   - **Token name**：`uptime-kuma-rustix`
-   - **Repository access**：Only select repositories → 勾选 `Keepalive`
-   - **Permissions**：Repository permissions → Actions → Read and write
-3. 复制生成的 Token（只显示一次）
-
-#### 2. Uptime Kuma 配置 Webhook 通知
-
-在 Uptime Kuma 新建通知，类型选 **Webhook**：
-
-| 字段 | 填写内容 |
-|------|---------|
-| 显示名称 | `Rustix 触发`（自定义） |
-| Post URL | `https://api.github.com/repos/<用户名>/Keepalive/dispatches` |
-| HTTP 方法 | `POST` |
-
-勾选「额外 Header」，填：
-
-```json
-{
-  "Authorization": "Bearer <你的PAT>",
-  "Accept": "application/vnd.github+json"
-}
-```
-
-请求体选「自定义」，填：
-
-```json
-{
-  "event_type": "cloudflare_cron_trigger",
-  "client_payload": {
-    "status": "{{ status }}"
-  }
-}
-```
-
-> 关键：`event_type` 必须为 `cloudflare_cron_trigger`，与 workflow 里 `types: [cloudflare_cron_trigger]` 对应。`{{ status }}` 是 Uptime Kuma 内置模板变量，DOWN 时为 `Down`，UP 时为 `Up`。
-
-#### 3. 关联到监控项
-
-在 Rustix 服务器对应的监控项设置页底部「通知」处，勾选刚创建的 Webhook 通知。
-
-#### 4. 测试
-
-- 手动 Pause 再 Resume 监控项，触发一次 DOWN
-- 去仓库 **Actions** 页面，应看到 `rustix-auto-alive` 产生新 run，触发事件显示 `repository_dispatch`
-- 若 workflow 加了 `if: status == 'Down'` 过滤，UP 恢复时 run 会 skipped（不消耗 Actions 分钟数）
 
 ## 说明
 
-- 账号密码等敏感信息仅通过 Secrets 传入，**不会**硬编码到脚本或提交到仓库。
-- 调试截图 `debug_*.png` 仅在找不到关键元素时生成，随运行日志一起上传 artifact（保留 7 天）。
-- 若站点页面结构更新导致选择器失效，可在 `find_button_by_text` / `find_first_visible` 中补充选择器。
-- `setup_proxy.sh` 来自第三方域名，该步骤仅接收 `NODE_LINK` 环境变量，其他 Secrets 不会暴露给它；sing-box 本体从 GitHub 官方 releases 下载。
-- 若配置节点后仍失败：先看 workflow 里 `⚙ 设置代理` 步骤的「直连 / 代理」对比测试输出——若代理路径超时/失败，说明节点出口 IP 被 Mitelis 拦截（机场节点多为机房 IP），需换**住宅/家宽 IP** 的节点；若代理测试正常（HTTP 403/200 都算可达）但脚本仍「页面加载超时」，说明是 Mitelis 挑战 JS 检测到自动化痕迹，请确认运行步骤使用了 `xvfb-run` + `HEADLESS=false` + `BROWSER_CHANNEL=chrome`（有头模式 + 真实 Chrome），并检查日志中 `📍 当前出口 IP` 与 `站点预检` 输出。
+- 账号密码等敏感信息仅通过 Secrets 传入，不会硬编码到脚本或提交到仓库
+- 调试截图仅在失败时生成，随 `run.log` 上传 artifact（保留 7 天）
+- `setup_proxy.sh` 来自第三方域名，该步骤仅接收 `NODE_LINK` 环境变量，其他 Secrets 不会暴露给它；sing-box 本体从 GitHub 官方 releases 下载
+- 站点语言为俄语/英语，选择器见 `find_button_by_text` / `find_input_by_placeholder`（注意俄语占位符大小写：`Пароль` 为大写 П）

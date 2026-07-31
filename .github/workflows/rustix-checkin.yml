@@ -1,96 +1,63 @@
 name: rustix-auto-alive
 
 on:
-  workflow_dispatch:                 # 手动触发（保留）
-  repository_dispatch:               # API 触发
-    types: [cloudflare_cron_trigger] # 与 Worker 中的 event_type 严格一致
-
-# 同一时间只允许一个实例运行
-concurrency:
-  group: rustix-auto
-  cancel-in-progress: false
-
-permissions:
-  repository-projects: write
-  actions: write
-  contents: write
+  schedule:
+    - cron: '0 */6 * * *' # 每 6 小时
+  workflow_dispatch:
+  repository_dispatch:
+    types: [cloudflare_cron_trigger]
 
 jobs:
   rustix-alive:
-    # 若需根据条件执行，可在此添加 if，例如：
-    # if: github.event_name == 'repository_dispatch' && github.event.client_payload.status == 'Down'
-    # 现在无条件执行（每次触发都运行）
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    permissions:
+      actions: write
+      contents: read
 
     steps:
-      - name: 🐛 调试 - 打印收到的 client_payload
-        run: |
-          echo "event_name: ${{ github.event_name }}"
-          echo 'client_payload: ${{ toJSON(github.event.client_payload) }}'
+      - uses: actions/checkout@v6
 
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 设置 Python
-        uses: actions/setup-python@v5
+      - name: ⚙ 设置 Python
+        uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
-          cache: "pip"
-          cache-dependency-path: rustix-auto/requirements.txt
+          python-version: '3.12'
 
-      - name: 安装依赖
-        working-directory: rustix-auto
+      - name: 🛠 安装系统依赖和 Python 依赖
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          sudo apt-get update
+          sudo apt-get install -y xvfb x11-utils xdotool scrot fonts-noto-cjk jq wget
+          pip install -r rustix-auto/requirements.txt
+          seleniumbase install chromedriver
 
-      - name: 安装 Playwright 浏览器
-        run: |
-          sudo apt-get install -y xvfb
-          python -m playwright install --with-deps chromium
-          python -m playwright install chrome
-
-      # 配置 NODE_LINK secret（节点链接）后自动在 runner 上起 sing-box 本地代理，
-      # 浏览器流量经节点出口访问 my.rustix.me，避开机房 IP 被 Mitelis 拦截的问题。
-      # 未配置 NODE_LINK 时脚本自动进入直连模式，不影响原有流程。
-      # 步骤末尾会分别用「直连」和「代理」测试访问 my.rustix.me，用于判断
-      # 当前出口 IP 是否被 Mitelis 拦截（若代理测试超时/失败 => 节点出口 IP 也被拦截，需换节点）。
+      # 可选：配置 NODE_LINK secret（节点链接）后，浏览器流量经 sing-box 节点出口
+      # 访问 my.rustix.me。未配置时自动直连，不影响流程。
       - name: ⚙ 设置代理 (sing-box)
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
           bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
-          echo "--- 访问测试 my.rustix.me ---"
-          curl -s -o /dev/null -w "直连: HTTP %{http_code} | 耗时 %{time_total}s\n" -m 20 https://my.rustix.me/auth/login || echo "直连: 超时/失败（机房 IP 被拦）"
-          # IS_PROXY 由 setup_proxy.sh 写入 GITHUB_ENV，同一步骤内不可见，改用端口探测判断代理是否已启动
-          if (exec 3<>/dev/tcp/127.0.0.1/1080) 2>/dev/null; then
-            curl -x socks5h://127.0.0.1:1080 -s -o /dev/null -w "代理: HTTP %{http_code} | 耗时 %{time_total}s\n" -m 20 https://my.rustix.me/auth/login || echo "代理: 超时/失败（节点出口 IP 可能也被 Mitelis 拦截，需换节点）"
-          else
-            echo "代理: 未启用（未配置 NODE_LINK）"
-          fi
 
-      - name: 运行自动启动脚本
+      - name: 🚀 运行自动启动脚本 (seleniumbase UC)
         working-directory: rustix-auto
         env:
           ACCOUNTS: ${{ secrets.RUSTIX_ACCOUNTS }}
           RUSTIX_COOKIE: ${{ secrets.RUSTIX_COOKIE }}
-          RUSTIX_SERVERID: ${{ secrets.RUSTIX_SERVERID }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          # Mitelis 挑战 JS 会检测无头/自动化痕迹：用真实 Chrome + 有头模式（xvfb 虚拟显示）
-          HEADLESS: "false"
-          BROWSER_CHANNEL: chrome
         run: |
-          xvfb-run --auto-servernum python main.py
+          # Mitelis 挑战会拖死无头/自动化浏览器：uc 模式 + 有头（xvfb 虚拟显示）
+          xvfb-run --auto-servernum python3 main.py
 
-      - name: 🧽 清理 sing-box 进程
+      - name: 🧽 清理进程
         if: always()
         run: |
           pkill -f sing-box || true
+          pkill -f chromedriver || true
+          pkill -f chrome || true
+          pkill -f Xvfb || true
+          rm -f sing-box sing-box-config.json sing-box.log
 
-      - name: 上传运行日志
+      - name: 📦 上传运行日志
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -100,3 +67,15 @@ jobs:
             rustix-auto/debug_*.png
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: 🧹 清理旧 Workflow 运行记录
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          count=0
+          for id in $(echo "$runs" | head -n -1); do
+            gh run delete "$id" --yes && count=$((count+1))
+          done
+          echo "已删除 $count 条旧运行记录"

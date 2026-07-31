@@ -1,27 +1,38 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Rustix 服务器自动启动脚本
-- 支持多账号轮流操作
-- 优先支持 Cookie 登录 (RUSTIX_COOKIE)，失效或未配置时自动降级至账号密码登录
-- 通过 Manage Server -> 判断 start 按钮状态 -> 启动服务器
-- 监听浏览器控制台 "Running Done!" 确认上线
-- 通过 stop 按钮可点击状态验证（不点击 stop）
-- 脚本末尾自动清理旧 workflow 运行记录
+Rustix 服务器自动启动脚本 (seleniumbase UC 版)
+=============================================
+基于 Auto-Renew-Bothosting 验证过的反自动化方案：
+  - seleniumbase uc 模式（undetected Chrome，真实浏览器指纹）
+  - 有头模式运行（CI 中由 workflow 通过 xvfb-run 提供虚拟显示）
+  - uc_open_with_reconnect 绕过 Mitelis 多层 JS 挑战
+    （mit_ck_p1 cookie -> JS 设 mit_ck_p2 -> 74KB 混淆脚本执行证明，
+     无头/带自动化标记的浏览器会被拖死，表现为 domcontentloaded 永不触发）
+
+流程：
+  加载账号 -> 站点可达性预检 -> UC 浏览器登录（密码优先，Cookie 降级）
+  -> Manage Server -> 判断 start 按钮状态 -> 点击启动 -> 确认 Running Done!
+
+环境变量：
+  ACCOUNTS / ACCOUNTS_FILE   账号（email:password 逗号分隔；或 JSON 文件）
+  RUSTIX_COOKIE              Cookie 降级登录（可选）
+  IS_PROXY / PROXY_SERVER    代理（workflow 由 setup_proxy.sh 写入 GITHUB_ENV）
+  TG_BOT_TOKEN / TG_CHAT_ID  Telegram 通知（可选）
+  HEADLESS                   uc 模式默认有头；设 "true" 强制无头（仅调试用）
 
 站点语言：俄语 / 英语（不支持中文）
 """
 
+import argparse
 import json
+import logging
 import os
 import sys
 import time
-import logging
-import argparse
-from datetime import datetime
 
 import requests
-from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout
+from seleniumbase import SB
 
 import notify
 
@@ -37,93 +48,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("rustix-auto")
 
-LOGIN_URL = "https://my.rustix.me/auth/login"
-HOME_URL = "https://my.rustix.me"
-START_WAIT_TIMEOUT = 180
-STEP_WAIT = 3000
-LOGIN_PAGE_WAIT = 6000
+BASE_URL = "https://my.rustix.me"
+LOGIN_URL = f"{BASE_URL}/auth/login"
+STEP_WAIT = 2  # 秒
 
-# ---------------- 代理配置（可选，与 Auto-Renew-Bothosting 相同接口） ----------------
-# IS_PROXY=true 时，浏览器流量走 PROXY_SERVER 指定的代理出口。
-# 在 GitHub Actions 中，setup_proxy.sh 会把节点(NODE_LINK)转成本地 sing-box 代理，
-# 并自动写入 IS_PROXY=true 和 PROXY_SERVER=socks5://127.0.0.1:1080 到 GITHUB_ENV，
-# 后续步骤自动继承，无需手动配置；本地调试时可直接设置环境变量。
 IS_PROXY = os.environ.get("IS_PROXY", "false").strip().lower() == "true"
 PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip() or "http://127.0.0.1:1080"
 
 
-# ---------------- GitHub Secret 更新 ----------------
-def update_github_secret(secret_name: str, secret_value: str) -> bool:
-    gh_token = os.environ.get("GH_TOKEN", "").strip()
-    if not gh_token:
-        logger.info("未配置 GH_TOKEN，跳过更新 GitHub Secret")
-        return False
-
-    repo_full_name = os.environ.get("GITHUB_REPOSITORY", "").strip()
-    if not repo_full_name:
-        logger.warning("未获取到 GITHUB_REPOSITORY 环境变量")
-        return False
-
-    public_key_url = f"https://api.github.com/repos/{repo_full_name}/actions/secrets/public-key"
-    secret_url = f"https://api.github.com/repos/{repo_full_name}/actions/secrets/{secret_name}"
-    headers = {
-        "Authorization": f"token {gh_token}",
-        "Accept": "application/vnd.github.v3+json",
-    }
-
-    try:
-        resp = requests.get(public_key_url, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            logger.warning(f"获取 GitHub Public Key 失败: {resp.status_code}")
-            return False
-        public_key_data = resp.json()
-        public_key = public_key_data.get("key", "")
-        key_id = public_key_data.get("key_id", "")
-        if not public_key or not key_id:
-            logger.warning("获取到的 Public Key 不完整")
-            return False
-    except Exception as e:
-        logger.warning(f"获取 GitHub Public Key 异常: {e}")
-        return False
-
-    try:
-        import base64
-        from nacl import public, encoding
-
-        public_key_obj = public.PublicKey(public_key.encode("utf-8"), encoding.Base64Encoder())
-        sealed_box = public.SealedBox(public_key_obj)
-        encrypted = sealed_box.encrypt(secret_value.encode("utf-8"))
-        encrypted_b64 = base64.b64encode(encrypted).decode("utf-8")
-
-        payload = {"encrypted_value": encrypted_b64, "key_id": key_id}
-        resp = requests.put(secret_url, headers=headers, json=payload, timeout=10)
-        if resp.status_code in (201, 204):
-            logger.info(f"成功更新 GitHub Secret: {secret_name}")
-            return True
-        else:
-            logger.warning(f"更新 GitHub Secret 失败: {resp.status_code}")
-            return False
-    except Exception as e:
-        logger.warning(f"加密更新异常: {e}")
-        return False
-
-
-def save_cookies(context) -> bool:
-    try:
-        cookies = context.cookies()
-        if not cookies:
-            logger.info("未获取到任何 Cookie")
-            return False
-        cookie_json = json.dumps(cookies, indent=2)
-        logger.info(f"获取到 {len(cookies)} 个 Cookie")
-        return update_github_secret("RUSTIX_COOKIE", cookie_json)
-    except Exception as e:
-        logger.warning(f"保存 Cookie 异常: {e}")
-        return False
-
-
 # ---------------- 账号加载 ----------------
-def parse_accounts_string(raw: str):
+def parse_accounts_string(raw: str) -> list:
     accounts = []
     for item in raw.split(","):
         item = item.strip()
@@ -136,7 +70,7 @@ def parse_accounts_string(raw: str):
     return accounts
 
 
-def load_accounts():
+def load_accounts() -> list:
     accounts_env = os.environ.get("ACCOUNTS", "").strip()
     if accounts_env:
         accounts = parse_accounts_string(accounts_env)
@@ -156,690 +90,303 @@ def load_accounts():
     raise RuntimeError("未配置账号：请设置环境变量 ACCOUNTS（格式 email:password,...）或创建 accounts.json")
 
 
-def load_cookies_for_account(email: str) -> list:
-    cookie_env = os.environ.get("RUSTIX_COOKIE", "").strip()
-    if not cookie_env:
-        logger.info("未配置 RUSTIX_COOKIE 环境变量")
-        return []
-    try:
-        data = json.loads(cookie_env)
-        if isinstance(data, dict) and email in data:
-            logger.info(f"成功匹配到账号 {email} 的专属 Cookie")
-            return data[email]
-        if isinstance(data, list):
-            logger.info("载入通用 Cookie 配置")
-            return data
-        if isinstance(data, dict) and "name" in data:
-            logger.info("载入单条 Cookie")
-            return [data]
-    except json.JSONDecodeError as e:
-        logger.warning(f"解析 RUSTIX_COOKIE 失败 (JSON 格式错误): {e}")
-    except Exception as e:
-        logger.warning(f"解析 RUSTIX_COOKIE 异常: {e}")
-    return []
+# ---------------- 元素查找（俄语占位符注意大小写） ----------------
+def find_input_by_placeholder(sb, keywords, name_fallbacks=()):
+    """通过 placeholder 关键词查找输入框（CSS 属性子串匹配，区分大小写）。
 
-
-# ---------------- 通用辅助 ----------------
-def is_clickable(locator) -> bool:
-    try:
-        if locator.count() == 0:
-            return False
-        el = locator.first
-        if not el.is_visible() or not el.is_enabled():
-            return False
-        if el.get_attribute("disabled") is not None:
-            return False
-        aria_disabled = el.get_attribute("aria-disabled")
-        if aria_disabled and aria_disabled.lower() == "true":
-            return False
-        if el.evaluate("el => getComputedStyle(el).pointerEvents") == "none":
-            return False
-        return True
-    except Exception:
-        return False
-
-
-def find_first_visible(page: Page, selectors):
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            if loc.count() > 0 and loc.is_visible():
-                return loc, sel
-        except Exception:
-            continue
-    # 降级：用 Playwright 的 getByPlaceholder / getByRole 直接查找
-    placeholders = {
-        "почта": ("placeholder", "почта"),
-        "username": ("placeholder", "username"),
-        "email": ("placeholder", "email"),
-        "password": ("placeholder", "password"),
-        "пароль": ("placeholder", "пароль"),
-    }
-    return None, None
-
-
-def find_input_by_placeholder(page: Page, keywords: list):
-    """通过 placeholder 关键词查找输入框，支持俄语/英语。"""
+    Rustix 登录框占位符为俄语：「Имя пользователя или эл. почта」与「Пароль」
+    （П 大写），关键词必须覆盖实际大小写；name 属性兜底由调用方按字段语义传入
+    （邮箱 -> username/email，密码 -> password），避免串找。
+    """
     for kw in keywords:
         try:
-            loc = page.get_by_placeholder(kw, exact=False).first
-            if loc.count() > 0 and loc.is_visible():
-                return loc
+            sel = f'input[placeholder*="{kw}"]'
+            if sb.is_element_visible(sel):
+                return sel
+        except Exception:
+            continue
+    for name in name_fallbacks:
+        try:
+            sel = f'input[name="{name}"]'
+            if sb.is_element_visible(sel):
+                return sel
         except Exception:
             continue
     return None
 
 
-def find_button_by_text(page: Page, texts):
+def find_button_by_text(sb, texts):
+    """查找可见按钮/链接（seleniumbase 支持 :contains 伪类）。"""
     for text in texts:
-        for sel in [
-            f'button:has-text("{text}")',
-            f'a:has-text("{text}")',
-            f'[role="button"]:has-text("{text}")',
-            f'input[type="submit"][value*="{text}" i]',
-            f'input[type="button"][value*="{text}" i]',
-        ]:
+        for sel in (f'button:contains("{text}")', f'a:contains("{text}")'):
             try:
-                loc = page.locator(sel).first
-                if loc.count() > 0 and loc.is_visible():
-                    return loc, sel, text
+                if sb.is_element_visible(sel):
+                    return sel
             except Exception:
                 continue
-    return None, None, None
+    return None
 
 
-def find_start_button(page: Page):
-    return find_button_by_text(page, ["Start", "Запустить", "Power On", "Boot"])
-
-
-def find_stop_button(page: Page):
-    return find_button_by_text(page, ["Stop", "Остановить", "Power Off", "Shut down", "Shutdown"])
-
-
-def check_server_online(page: Page) -> bool:
-    try:
-        status_spans = page.locator("span.text-success-50, span[class*='text-success']")
-        count = status_spans.count()
-        for i in range(count):
-            text = (status_spans.nth(i).text_content() or "").strip().lower()
-            if text in ("online", "запущен"):
-                return True
-
-        card_spans = page.locator("span[class*='ServerCardGradient']")
-        count = card_spans.count()
-        for i in range(count):
-            text = (card_spans.nth(i).text_content() or "").strip().lower()
-            if text in ("online", "запущен"):
-                return True
-
-        start_btn, _, _ = find_start_button(page)
-        stop_btn, _, _ = find_stop_button(page)
-        if start_btn and stop_btn:
-            if not is_clickable(start_btn) and is_clickable(stop_btn):
-                return True
-    except Exception:
-        pass
-    return False
-
-
-# ---------------- 出口 IP 检测（验证代理节点是否生效） ----------------
-def get_current_ip() -> str:
-    """通过代理请求 api.ip.sb 获取当前出口 IP，用于确认节点已生效。
-
-    代理不可用/超时等异常会向上抛出，由调用方兜底（仅警告，不中断流程）。
-    注意：GitHub API 相关请求（更新 secret、清理 workflow）不走代理，保持直连。
-    """
-    proxies = None
-    if IS_PROXY:
-        proxies = {"http": PROXY_SERVER, "https": PROXY_SERVER}
-    resp = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
-    resp.raise_for_status()
-    return resp.text.strip()
-
-
-def safe_screenshot(page: Page, name: str):
-    """调试截图的安全封装：短超时 + 禁用动画 + 失败仅警告。
-
-    页面卡在加载/动画中时 Playwright 截图会默认等 30s 甚至超时抛异常，
-    把调试手段变成流程崩溃点。这里限时 8s 且吞掉异常。
-    """
-    try:
-        page.screenshot(path=name, timeout=8000, animations="disabled")
-    except Exception as e:
-        logger.warning(f"截图失败（跳过）: {e}")
+# ---------------- 网络预检 ----------------
+def get_current_ip(proxy_server: str = "") -> str:
+    proxies = {"http": proxy_server, "https": proxy_server} if proxy_server else None
+    response = requests.get("https://api.ip.sb/ip", proxies=proxies, timeout=15)
+    response.raise_for_status()
+    return response.text.strip()
 
 
 def check_site_reachable(timeout: int = 20) -> bool:
-    """通过当前网络路径（代理或直连）探测 my.rustix.me 是否可达。
-
-    返回 True 表示 TCP/TLS/HTTP 握手已完成（HTTP 4xx 也算可达，可能是
-    WAF 挑战页）；超时/连接失败返回 False，说明当前出口 IP 大概率被
-    Mitelis 拦截，继续走浏览器流程只会白等 60s 再崩，不如快速失败。
-    """
-    proxies = None
-    if IS_PROXY:
-        proxies = {"http": PROXY_SERVER, "https": PROXY_SERVER}
+    """站点可达性预检：20 秒内能拿到 HTTP 响应即视为可达（403/200 都算）。"""
+    proxies = {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
     try:
-        start = time.time()
         resp = requests.get(
-            LOGIN_URL, proxies=proxies, timeout=timeout, allow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            LOGIN_URL,
+            proxies=proxies,
+            timeout=timeout,
+            allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"},
         )
-        elapsed = time.time() - start
-        logger.info(f"站点预检: HTTP {resp.status_code} | 耗时 {elapsed:.1f}s | {resp.url[:80]}")
+        logger.info(f"站点预检: HTTP {resp.status_code} | 耗时 {resp.elapsed.total_seconds():.1f}s | {resp.url}")
         return True
     except Exception as e:
         logger.error(f"站点预检失败（{timeout}s 内未完成连接）: {e}")
         return False
 
 
-# ---------------- 登录流程 ----------------
-def do_login(page: Page, email: str, password: str) -> bool:
-    logger.info(f"打开登录页: {LOGIN_URL}")
-    for attempt in range(2):
-        try:
-            # 用 commit 而非 domcontentloaded：Mitelis 挑战页会设置 cookie 后自动
-            # location.replace 刷新，等 domcontentloaded 会被挑战流程反复打断而超时
-            page.goto(LOGIN_URL, wait_until="commit", timeout=30000)
-            break
-        except PWTimeout:
-            logger.warning(f"页面加载超时（第 {attempt + 1}/2 次），重试...")
-            page.wait_for_timeout(2000)
-    else:
-        logger.warning("页面加载持续超时，继续尝试")
+# ---------------- Mitelis 挑战处理 ----------------
+def wait_login_form(sb, timeout: int = 60) -> bool:
+    """轮询等待登录表单出现。
 
-    # 等待 Mitelis 挑战链完成：挑战 JS 通过后会刷新出真实登录页，
-    # 轮询等待输入框出现（最长 90 秒），期间页面可能多次自动刷新
-    email_loc = pwd_loc = None
-    deadline = time.time() + 90
+    Mitelis 挑战链通过后页面才会出现真实登录表单（email/password 输入框），
+    挑战页特征：极小 HTML + 内嵌 script 设 mit_ck_p2 + 解析阻塞混淆脚本，无 input。
+    """
+    deadline = time.time() + timeout
     while time.time() < deadline:
-        email_loc = find_input_by_placeholder(page, ["почта", "username", "email", "user"])
-        pwd_loc = find_input_by_placeholder(page, ["пароль", "password"])
-        if email_loc and pwd_loc:
-            break
-        page.wait_for_timeout(2000)
+        try:
+            email_sel = find_input_by_placeholder(
+                sb, ["почта", "username", "email", "user"], name_fallbacks=("username", "user", "email", "login")
+            )
+            pwd_sel = find_input_by_placeholder(
+                sb, ["Пароль", "пароль", "password"], name_fallbacks=("password",)
+            )
+            if email_sel and pwd_sel:
+                return True
+        except Exception:
+            pass
+        sb.sleep(1)
+    return False
 
-    # 降级用 CSS 选择器
-    if not email_loc:
-        email_loc, email_sel = find_first_visible(page, [
-            'input[name="username"]',
-            'input[type="email"]',
-            'input[name="email"]',
-            'input[autocomplete="username"]',
-        ])
-    if not pwd_loc:
-        pwd_loc, pwd_sel = find_first_visible(page, [
-            'input[type="password"]',
-            'input[name="password"]',
-            'input[autocomplete="current-password"]',
-        ])
 
-    if not email_loc or not pwd_loc:
-        safe_screenshot(page, f"debug_login_{int(time.time())}.png")
-        logger.error("未找到登录表单（邮箱/密码输入框）")
-        return False
-
-    logger.info(f"填写账号: {email}")
-    email_loc.fill(email)
-    pwd_loc.fill(password)
-    page.wait_for_timeout(500)
-
-    login_btn, login_sel, txt = find_button_by_text(page, ["Войти", "Login", "Sign in"])
-    if not login_btn:
-        login_btn, login_sel = find_first_visible(page, [
-            'button[type="submit"]',
-            'input[type="submit"]',
-        ])
-        txt = "submit(fallback)"
-
-    if not login_btn:
-        safe_screenshot(page, f"debug_login_{int(time.time())}.png")
-        logger.error("未找到登录按钮")
-        return False
-
-    logger.info(f"点击登录按钮 (text={txt})")
+def open_login_page(sb) -> bool:
+    """打开登录页并等待 Mitelis 挑战链结束，返回是否出现登录表单。"""
+    logger.info(f"打开登录页: {LOGIN_URL}")
     try:
-        login_btn.click()
+        # uc 核心：检测到挑战时断开并重连 CDP 会话，让挑战以为浏览器重启
+        sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=4)
+    except Exception as e:
+        logger.warning(f"uc_open_with_reconnect 异常，降级 sb.open: {e}")
+        try:
+            sb.open(LOGIN_URL)
+        except Exception as e2:
+            logger.warning(f"sb.open 也失败: {e2}")
+    logger.info("等待 Mitelis 挑战通过（最长 60s）...")
+    return wait_login_form(sb, timeout=60)
+
+
+# ---------------- 登录 ----------------
+def login_with_password(sb, email: str, password: str) -> bool:
+    if not open_login_page(sb):
+        logger.error("60s 内未出现登录表单（挑战未通过或站点不可达）")
+        try:
+            sb.save_screenshot("debug_login.png")
+        except Exception:
+            pass
+        return False
+
+    email_sel = find_input_by_placeholder(
+        sb, ["почта", "username", "email", "user"], name_fallbacks=("username", "user", "email", "login")
+    )
+    pwd_sel = find_input_by_placeholder(
+        sb, ["Пароль", "пароль", "password"], name_fallbacks=("password",)
+    )
+    logger.info("填写账号密码...")
+    sb.type(email_sel, email)
+    sb.type(pwd_sel, password)
+
+    login_btn = find_button_by_text(sb, ["Войти", "Login", "Sign in"]) or 'input[type="submit"]'
+    logger.info(f"点击登录按钮 ({login_btn})")
+    sb.click(login_btn)
+
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        url = sb.get_current_url()
+        if "/auth/login" not in url:
+            logger.info(f"✅ 登录成功，跳转至: {url}")
+            return True
+        sb.sleep(1)
+    logger.error("登录后未跳转（密码错误或页面异常）")
+    try:
+        sb.save_screenshot("debug_login_failed.png")
     except Exception:
-        login_btn.first.click(force=True)
+        pass
+    return False
 
+
+def login_with_cookie(sb) -> bool:
+    cookie_env = os.environ.get("RUSTIX_COOKIE", "").strip()
+    if not cookie_env:
+        logger.info("未配置 RUSTIX_COOKIE 环境变量")
+        return False
     try:
-        page.wait_for_load_state("networkidle", timeout=30000)
-    except PWTimeout:
-        logger.warning("登录后 networkidle 超时，继续流程")
-    page.wait_for_timeout(STEP_WAIT)
-
-    if "/auth/login" in page.url:
-        body = (page.inner_text("body") or "")[:500].lower()
-        if any(k in body for k in ["incorrect", "invalid", "неверн", "ошибк"]):
-            logger.error("登录失败：账号或密码错误")
-            return False
-        logger.error("登录后仍在登录页")
+        data = json.loads(cookie_env)
+        cookies = data if isinstance(data, list) else [data]
+    except json.JSONDecodeError as e:
+        logger.warning(f"RUSTIX_COOKIE 解析失败: {e}")
         return False
 
-    logger.info("登录成功")
-    return True
+    logger.info("载入 Cookie 登录...")
+    try:
+        sb.open(BASE_URL + "/")
+        sb.sleep(2)
+        for c in cookies:
+            try:
+                sb.add_cookie({"name": c["name"], "value": c["value"], "domain": "my.rustix.me"})
+            except Exception as e:
+                logger.warning(f"cookie 注入失败 {c.get('name')}: {e}")
+        sb.open(LOGIN_URL)
+        sb.sleep(4)
+    except Exception as e:
+        logger.warning(f"Cookie 登录流程异常: {e}")
+        return False
+
+    url = sb.get_current_url()
+    logger.info(f"Cookie 登录后 URL: {url}")
+    return "/auth/login" not in url
 
 
 # ---------------- Manage Server 流程 ----------------
-def click_manage_server(page: Page) -> bool:
+def click_manage_server(sb) -> bool:
     logger.info("寻找 Manage Server 按钮")
-    page.wait_for_timeout(STEP_WAIT)
-
-    manage, sel, txt = find_button_by_text(page, [
-        "Manage Server",
-        "Manage",
-        "Управление",
-        "Управлять сервером",
-    ])
-    if not manage:
-        manage, sel = find_first_visible(page, [
-            'a:has-text("Manage")',
-            'a:has-text("Управление")',
-            '[href*="manage" i]',
-        ])
-        txt = "Manage(fallback)"
-
-    if not manage:
-        page.screenshot(path=f"debug_dashboard_{int(time.time())}.png")
+    sb.sleep(STEP_WAIT)
+    sel = find_button_by_text(sb, ["Manage Server", "Manage", "Управление", "Управлять сервером"])
+    if not sel:
         logger.error("未找到 Manage Server 按钮")
+        try:
+            sb.save_screenshot("debug_dashboard.png")
+        except Exception:
+            pass
         return False
-
-    logger.info(f"点击 Manage Server 按钮 (text={txt})")
+    logger.info(f"点击 Manage Server ({sel})")
     try:
-        manage.click()
-    except Exception:
-        manage.first.click(force=True)
-
-    try:
-        page.wait_for_load_state("networkidle", timeout=30000)
-    except PWTimeout:
-        pass
-    page.wait_for_timeout(6000)
+        sb.click(sel)
+    except Exception as e:
+        logger.warning(f"点击异常: {e}")
+        try:
+            sb.js_click(sel)
+        except Exception:
+            return False
+    sb.sleep(6)
     return True
 
 
-# ---------------- 启动服务器流程 ----------------
-def start_server(page: Page, console_lines: list) -> str:
+def start_server(sb) -> str:
+    """启动服务器，返回状态（与 notify.STATUS_MAP 对齐）：
+    started=点击后确认上线 / online=本就在线 / no_start / offline=超时
+    """
     logger.info("寻找 start 按钮")
-    page.wait_for_timeout(STEP_WAIT)
+    sb.sleep(STEP_WAIT)
 
-    try:
-        page.wait_for_selector('button:has-text("Start")', timeout=15000)
-    except PWTimeout:
-        pass
-
-    start_btn, sel, txt = find_start_button(page)
-    if not start_btn:
-        page.screenshot(path=f"debug_start_{int(time.time())}.png")
+    start_sel = find_button_by_text(sb, ["Start", "Запустить", "Power On", "Boot"])
+    if not start_sel:
         logger.error("未找到 start 按钮")
+        try:
+            sb.save_screenshot("debug_start.png")
+        except Exception:
+            pass
         return "no_start"
 
-    clickable = is_clickable(start_btn)
+    clickable = False
+    try:
+        clickable = sb.is_element_clickable(start_sel)
+    except Exception:
+        pass
     logger.info(f"start 按钮可点击状态: {clickable}")
 
     if not clickable:
-        logger.info("start 按钮不可点击 -> 服务器可能已在线，跳过启动")
-        if check_server_online(page):
-            logger.info("确认服务器已在线")
+        logger.info("start 不可点击 -> 服务器已在线")
         return "online"
 
-    logger.info("服务器离线，点击 start 启动")
-    try:
-        start_btn.click(force=True)
-    except Exception:
-        start_btn.first.click(force=True)
+    logger.info("点击 start 启动服务器...")
+    sb.click(start_sel)
 
-    # 策略：先等 Running Done!，同时轮询页面状态，两者任一成功即可
-    logger.info(f"等待服务器启动（最长 {START_WAIT_TIMEOUT}s）")
-    deadline = time.time() + START_WAIT_TIMEOUT
-    detected = False
+    # 等待确认上线：页面出现 "Running Done!" 或 stop 按钮变为可点击（最多 120s）
+    deadline = time.time() + 120
     while time.time() < deadline:
-        # 方法1：检查控制台日志
-        if any("Running Done!" in line for line in console_lines):
-            detected = True
-            logger.info("检测到控制台 'Running Done!'")
-            break
-
-        # 方法2：检查页面文本
         try:
-            if page.locator(":text('Running Done!')").count() > 0:
-                detected = True
-                logger.info("检测到页面 'Running Done!' 文本")
-                break
+            if "Running Done!" in sb.get_page_source():
+                logger.info("✅ 检测到 'Running Done!'")
+                return "started"
+            stop_sel = find_button_by_text(sb, ["Stop", "Остановить", "Power Off", "Shut down", "Shutdown"])
+            if stop_sel:
+                try:
+                    if sb.is_element_clickable(stop_sel):
+                        logger.info("✅ stop 按钮已可点击（服务器已启动）")
+                        return "started"
+                except Exception:
+                    pass
         except Exception:
             pass
-
-        # 方法3：检查 start 按钮变回不可点击 + stop 按钮可点击
-        try:
-            s_btn, _, _ = find_start_button(page)
-            st_btn, _, _ = find_stop_button(page)
-            if s_btn and st_btn:
-                if not is_clickable(s_btn) and is_clickable(st_btn):
-                    detected = True
-                    logger.info("检测到状态变化: start 不可点击 + stop 可点击")
-                    break
-        except Exception:
-            pass
-
-        # 方法4：检查页面上是否出现 Online 状态文本
-        try:
-            body_text = (page.inner_text("body") or "").lower()
-            if "online" in body_text and ("status" in body_text or "состояние" in body_text):
-                # 进一步确认不是残留文本
-                if check_server_online(page):
-                    detected = True
-                    logger.info("检测到 Online 状态文本")
-                    break
-        except Exception:
-            pass
-
-        page.wait_for_timeout(3000)
-
-    if detected:
-        logger.info("服务器启动成功")
-    else:
-        logger.warning(f"等待 {START_WAIT_TIMEOUT}s 超时，尝试最终验证")
-
-    # 最终验证：等几秒后再次检查 stop 按钮
-    page.wait_for_timeout(STEP_WAIT)
-    if check_stop_button(page) == "clickable":
-        logger.info("验证成功：stop 按钮可点击，服务器已上线")
-        return "started"
-
-    # 再等一次，给服务器更多时间
-    logger.info("再次等待 30 秒后验证...")
-    page.wait_for_timeout(30000)
-    if check_stop_button(page) == "clickable":
-        logger.info("延迟验证成功：服务器已上线")
-        return "started"
-
-    logger.warning("验证未通过：服务器可能仍在启动中")
+        sb.sleep(3)
+    logger.warning("等待启动确认超时")
     return "offline"
 
 
-def check_stop_button(page: Page) -> str:
-    stop_btn, sel, txt = find_stop_button(page)
-
-    if not stop_btn:
-        stop_btn, sel = find_first_visible(page, [
-            'button:has-text("Stop")',
-            'button:has-text("Остановить")',
-            '[role="button"]:has-text("Stop")',
-            'input[value="Stop" i]',
-        ])
-
-    if not stop_btn:
-        logger.info("未找到 stop 按钮")
-        return "not_found"
-
-    clickable = is_clickable(stop_btn)
-    logger.info(f"stop 按钮可点击状态: {clickable} (不点击)")
-    return "clickable" if clickable else "exists_not_clickable"
-
-
-# ---------------- 跳转到控制台（Cookie 登录用） ----------------
-def navigate_to_console(page: Page) -> bool:
-    server_id = os.environ.get("RUSTIX_SERVERID", "").strip()
-    if not server_id:
-        logger.info("未配置 RUSTIX_SERVERID，跳过直接跳转")
-        return False
-
-    console_url = f"https://my.rustix.me/server/{server_id}/console"
-    logger.info(f"直接跳转到控制台页面: {console_url}")
-    try:
-        page.goto(console_url, wait_until="domcontentloaded", timeout=60000)
-    except PWTimeout:
-        logger.warning("控制台页面加载超时")
-    except Exception as e:
-        logger.warning(f"跳转异常: {e}")
-
-    try:
-        page.wait_for_url(lambda url: "/server/" in url and "/console" in url, timeout=15000)
-        logger.info(f"路由跳转成功: {page.url}")
-    except Exception:
-        logger.warning(f"等待路由超时，当前 URL: {page.url}")
-
-    page.wait_for_timeout(STEP_WAIT)
-    return True
-
-
-# ---------------- 单账号处理 ----------------
-def process_account(account: dict, playwright, headless: bool = True) -> dict:
-    email = account.get("email", "").strip()
-    password = account.get("password", "").strip()
+# ---------------- 账号处理 ----------------
+def process_account(account: dict, headless: bool = False) -> dict:
+    email, password = account["email"], account["password"]
     result = {"email": email, "ok": False, "status": "unknown", "error": ""}
-
-    if not email or not password:
-        result["error"] = "账号或密码为空"
-        logger.error(result["error"])
-        return result
-
     logger.info(f"========== 开始处理账号: {email} ==========")
-    browser = None
-    try:
-        # Mitelis 挑战 JS 会检测自动化痕迹（webdriver 标记、无头特征、UA 与真实浏览器版本不符）：
-        # - 禁用 AutomationControlled blink 特性
-        # - 有头模式运行（CI 中通过 xvfb-run 提供虚拟显示，见 workflow）
-        # - 不写死旧版 UA（Chrome/124 与实际浏览器版本不符是明显的机器人特征），
-        #   默认用 Playwright 随浏览器版本的真实 UA，可用 BROWSER_UA 覆盖
-        launch_kwargs = {
-            "headless": headless,
-            "args": [
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        }
-        chrome_channel = os.environ.get("BROWSER_CHANNEL", "").strip()
-        if chrome_channel:
-            launch_kwargs["channel"] = chrome_channel  # 用真实 Chrome 而非 Chromium 构建，更难被识别
-        browser = playwright.chromium.launch(**launch_kwargs)
 
-        context_kwargs = {
-            "viewport": {"width": 1366, "height": 800},
-            "locale": "en-US",
-        }
-        if IS_PROXY:
-            context_kwargs["proxy"] = {"server": PROXY_SERVER}
-        ua_override = os.environ.get("BROWSER_UA", "").strip()
-        if ua_override:
-            context_kwargs["user_agent"] = ua_override
-        context = browser.new_context(**context_kwargs)
-        page = context.new_page()
-        # 隐藏 navigator.webdriver 标记（WAF 挑战 JS 最常检测的特征）
-        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+    sb_kwargs = {"uc": True, "headless": headless}  # uc 模式需真实浏览器（CI 用 xvfb 虚拟显示）
+    if IS_PROXY:
+        sb_kwargs["proxy"] = PROXY_SERVER
+        logger.info(f"🔗 已启用代理: {PROXY_SERVER}")
 
-        console_lines = []
+    with SB(**sb_kwargs) as sb:
+        try:
+            logger.info("尝试账号密码登录（第一选择）...")
+            login_ok = login_with_password(sb, email, password)
+            if not login_ok:
+                logger.warning("密码登录失败，降级尝试 Cookie 登录...")
+                login_ok = login_with_cookie(sb)
 
-        def on_console(msg):
-            text = msg.text or ""
-            console_lines.append(text)
-            low = text.lower()
-            if any(k in low for k in ["running done", "app is running", "error", "started"]):
-                logger.info(f"[console] {text[:200]}")
-
-        page.on("console", on_console)
-        page.on("pageerror", lambda err: logger.warning(f"[pageerror] {err}"))
-
-        # === 站点可达性预检（代理/直连）===
-        # my.rustix.me 挂在 Mitelis DDoS 防护后，会拦截/拖死机房 IP：
-        # 预检不通时继续走浏览器只会白等 60s+30s 再崩，直接快速失败并给出明确原因。
-        if not check_site_reachable():
-            result["error"] = "my.rustix.me 不可达（当前出口 IP 被拦截？）。代理模式下请确认节点出口 IP 未被 Mitelis 拦截"
-            logger.error(result["error"])
-            return result
-
-        # === 第一选择：账号密码登录 ===
-        password_login_success = False
-        logger.info("尝试账号密码登录（第一选择）...")
-        if do_login(page, email, password):
-            password_login_success = True
-            # 登录成功后立即更新 Cookie 到 GitHub Secrets
-            logger.info("登录成功，正在更新 RUSTIX_COOKIE...")
-            save_cookies(context)
-        else:
-            logger.warning("密码登录失败")
-
-        # === 第二选择：Cookie 登录（密码失败时降级） ===
-        cookie_login_success = False
-        if not password_login_success:
-            cookies = load_cookies_for_account(email)
-            if cookies:
-                logger.info("密码登录失败，降级尝试 Cookie 登录...")
-                try:
-                    for c in cookies:
-                        if "domain" not in c:
-                            c["domain"] = "my.rustix.me"
-                    context.add_cookies(cookies)
-                    page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
-                    page.wait_for_timeout(6000)
-
-                    if "/auth/login" not in page.url:
-                        server_link, _ = find_first_visible(page, ['a[href*="/server/"][href*="/console"]'])
-                        manage_btn, _, _ = find_button_by_text(page, ["Manage Server", "Manage", "Управление"])
-                        if server_link or manage_btn:
-                            logger.info("Cookie 验证成功！")
-                            cookie_login_success = True
-                        else:
-                            logger.warning("Cookie 登录验证未通过（无服务器元素）")
-                    else:
-                        logger.warning("Cookie 已过期，被重定向到登录页")
-                except Exception as e:
-                    logger.warning(f"Cookie 登录异常: {e}")
-
-        if not password_login_success and not cookie_login_success:
-            result["error"] = "密码登录和 Cookie 登录均失败"
-            return result
-
-        # === 导航到服务器管理页面 ===
-        if cookie_login_success and navigate_to_console(page):
-            # Cookie 降级登录 + 直接跳转控制台
-            status = start_server(page, console_lines)
-        else:
-            # 标准流程：Manage Server -> 控制台
-            if not click_manage_server(page):
-                result["error"] = "未找到 Manage Server"
-                return result
-            status = start_server(page, console_lines)
-
-        result["status"] = status
-        result["ok"] = status in ("started", "online")
-        return result
-
-    except Exception as e:
-        result["error"] = f"异常: {e}"
-        logger.exception("处理账号时发生异常")
-        return result
-    finally:
-        if browser:
+            if login_ok:
+                result["status"] = "login_ok"
+                if click_manage_server(sb):
+                    status = start_server(sb)
+                    result["status"] = status
+                    result["ok"] = status in ("started", "online")
+                    result["error"] = "" if result["ok"] else f"启动流程: {status}"
+                else:
+                    result["error"] = "未找到 Manage Server 按钮"
+            else:
+                result["status"] = "unknown"
+                result["error"] = "密码登录和 Cookie 登录均失败"
+        except Exception as e:
+            result["error"] = str(e)[:300]
+            logger.error(f"处理账号时发生异常: {e}")
             try:
-                browser.close()
+                sb.save_screenshot("debug_exception.png")
             except Exception:
                 pass
-        logger.info(f"========== 账号 {email} 处理结束: status={result['status']} ==========\n")
 
-
-# ---------------- Workflow 清理 ----------------
-def cleanup_old_workflow_runs(keep_runs: int = 1):
-    gh_token = os.environ.get("GH_TOKEN", "").strip()
-    repo_full_name = os.environ.get("GITHUB_REPOSITORY", "").strip()
-
-    if not gh_token or not repo_full_name:
-        logger.info("未检测到 GH_TOKEN 或 GITHUB_REPOSITORY，跳过 workflow 清理")
-        return
-
-    api_base = f"https://api.github.com/repos/{repo_full_name}"
-    headers = {
-        "Authorization": f"token {gh_token}",
-        "Accept": "application/vnd.github.v3+json",
-    }
-
-    logger.info("========== 开始清理旧 Workflow 运行记录 ==========")
-
-    try:
-        resp = requests.get(f"{api_base}/actions/workflows", headers=headers, timeout=15)
-        if resp.status_code != 200:
-            logger.warning(f"获取 workflows 失败: {resp.status_code}")
-            return
-        workflows = resp.json().get("workflows", [])
-        logger.info(f"仓库共 {len(workflows)} 个 workflow")
-    except Exception as e:
-        logger.warning(f"获取 workflows 异常: {e}")
-        return
-
-    total_deleted = 0
-    total_failed = 0
-
-    for wf in workflows:
-        wf_id = wf.get("id")
-        wf_name = wf.get("name", "unknown")
-        wf_state = wf.get("state", "unknown")
-
-        if not wf_id:
-            continue
-        if wf_state != "active":
-            logger.info(f"  跳过未启用的 workflow: {wf_name} ({wf_state})")
-            continue
-
-        try:
-            page = 1
-            all_run_ids = []
-            while True:
-                runs_resp = requests.get(
-                    f"{api_base}/actions/workflows/{wf_id}/runs",
-                    headers=headers,
-                    params={"per_page": 100, "page": page, "status": "completed"},
-                    timeout=15,
-                )
-                if runs_resp.status_code != 200:
-                    break
-                runs = runs_resp.json().get("workflow_runs", [])
-                if not runs:
-                    break
-                for r in runs:
-                    all_run_ids.append(r.get("id"))
-                if len(runs) < 100:
-                    break
-                page += 1
-
-            if len(all_run_ids) <= keep_runs:
-                logger.info(f"  ✓ {wf_name}: {len(all_run_ids)} 条记录，无需清理")
-                continue
-
-            to_delete = all_run_ids[keep_runs:]
-            logger.info(f"  🗑 {wf_name}: 共 {len(all_run_ids)} 条，保留 {keep_runs} 条，删除 {len(to_delete)} 条")
-
-            deleted = 0
-            for run_id in to_delete:
-                try:
-                    del_resp = requests.delete(
-                        f"{api_base}/actions/runs/{run_id}",
-                        headers=headers,
-                        timeout=10,
-                    )
-                    if del_resp.status_code in (204, 200):
-                        deleted += 1
-                    else:
-                        total_failed += 1
-                except Exception:
-                    total_failed += 1
-                time.sleep(0.3)
-
-            total_deleted += deleted
-            logger.info(f"    已删除 {deleted}/{len(to_delete)} 条")
-
-        except Exception as e:
-            logger.warning(f"  清理 {wf_name} 时异常: {e}")
-            total_failed += 1
-
-    logger.info(f"========== Workflow 清理完成: 删除 {total_deleted} 条, 失败 {total_failed} 条 ==========")
+    logger.info(f"========== 账号 {email} 处理结束: status={result['status']} ==========")
+    return result
 
 
 # ---------------- 主入口 ----------------
 def main():
-    parser = argparse.ArgumentParser(description="Rustix 服务器自动启动")
-    parser.add_argument("--headed", action="store_true", help="非无头模式（调试用）")
+    parser = argparse.ArgumentParser(description="Rustix 服务器自动启动 (seleniumbase UC)")
     parser.add_argument("--only", help="只处理指定邮箱的账号")
     args = parser.parse_args()
 
@@ -851,50 +398,42 @@ def main():
             sys.exit(1)
 
     logger.info(f"共 {len(accounts)} 个账号待处理")
-    results = []
-    if notify.tg_enabled():
-        logger.info("已启用 Telegram 通知")
+
+    # uc 模式默认有头（无头会被 Mitelis 挑战识别），CI 由 xvfb-run 提供显示
+    headless = os.environ.get("HEADLESS", "").strip().lower() in ("1", "true", "yes")
+    if headless:
+        logger.warning("HEADLESS=true：无头模式可能被 Mitelis 挑战识别，建议仅在调试时使用")
 
     if IS_PROXY:
         logger.info(f"🔗 已启用代理: {PROXY_SERVER}")
         try:
-            ip = get_current_ip()
-            logger.info(f"📍 当前出口 IP: {ip}")
+            logger.info(f"📍 当前出口 IP: {get_current_ip(PROXY_SERVER)}")
         except Exception as e:
             logger.warning(f"⚠️ 获取出口 IP 失败（检查节点是否可用）: {e}")
     else:
-        logger.info("🍭 未启用代理，直连访问（若目标站拦截机房 IP，请配置 NODE_LINK）")
+        logger.info("🍭 未启用代理，直连访问（若账号级风控拦截，请配置 NODE_LINK）")
 
-    with sync_playwright() as pw:
-        # CI 中通过 HEADLESS=false + xvfb-run 以有头模式运行（规避 WAF 无头检测）
-        headless = not args.headed
-        if os.environ.get("HEADLESS", "").strip().lower() in ("0", "false", "no"):
-            headless = False
-        for idx, acc in enumerate(accounts, 1):
-            logger.info(f"--- 第 {idx}/{len(accounts)} 个账号 ---")
-            res = process_account(acc, pw, headless=headless)
-            results.append(res)
-            if idx < len(accounts):
-                time.sleep(5)
+    if not check_site_reachable():
+        logger.error("站点不可达，跳过本次执行（快速失败）")
+        sys.exit(1)
+
+    results = []
+    for idx, acc in enumerate(accounts, 1):
+        logger.info(f"--- 第 {idx}/{len(accounts)} 个账号 ---")
+        results.append(process_account(acc, headless=headless))
+        if idx < len(accounts):
+            time.sleep(5)
 
     logger.info("================ 结果汇总 ================")
-    ok = 0
     for r in results:
         flag = "OK" if r["ok"] else "FAIL"
         logger.info(f"[{flag}] {r['email']} | status={r['status']} | {r['error']}")
-        if r["ok"]:
-            ok += 1
-    logger.info(f"成功 {ok}/{len(results)}")
 
     if notify.tg_enabled():
         notify.notify_summary(results)
 
-    try:
-        cleanup_old_workflow_runs(keep_runs=1)
-    except Exception as e:
-        logger.warning(f"workflow 清理异常: {e}")
-
-    sys.exit(0 if ok == len(results) and ok > 0 else 1)
+    failed = [r for r in results if not r["ok"]]
+    sys.exit(1 if failed else 0)
 
 
 if __name__ == "__main__":
