@@ -46,7 +46,10 @@ jobs:
           pip install -r requirements.txt
 
       - name: 安装 Playwright 浏览器
-        run: python -m playwright install --with-deps chromium
+        run: |
+          sudo apt-get install -y xvfb
+          python -m playwright install --with-deps chromium
+          python -m playwright install chrome
 
       # 配置 NODE_LINK secret（节点链接）后自动在 runner 上起 sing-box 本地代理，
       # 浏览器流量经节点出口访问 my.rustix.me，避开机房 IP 被 Mitelis 拦截的问题。
@@ -76,7 +79,11 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: python main.py
+          # Mitelis 挑战 JS 会检测无头/自动化痕迹：用真实 Chrome + 有头模式（xvfb 虚拟显示）
+          HEADLESS: "false"
+          BROWSER_CHANNEL: chrome
+        run: |
+          xvfb-run --auto-servernum python main.py
 
       - name: 🧽 清理 sing-box 进程
         if: always()

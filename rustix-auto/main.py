@@ -338,7 +338,9 @@ def do_login(page: Page, email: str, password: str) -> bool:
     logger.info(f"打开登录页: {LOGIN_URL}")
     for attempt in range(2):
         try:
-            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+            # 用 commit 而非 domcontentloaded：Mitelis 挑战页会设置 cookie 后自动
+            # location.replace 刷新，等 domcontentloaded 会被挑战流程反复打断而超时
+            page.goto(LOGIN_URL, wait_until="commit", timeout=30000)
             break
         except PWTimeout:
             logger.warning(f"页面加载超时（第 {attempt + 1}/2 次），重试...")
@@ -346,11 +348,16 @@ def do_login(page: Page, email: str, password: str) -> bool:
     else:
         logger.warning("页面加载持续超时，继续尝试")
 
-    page.wait_for_timeout(LOGIN_PAGE_WAIT)
-
-    # 优先用 placeholder 查找（Rustix 登录框是俄语 placeholder）
-    email_loc = find_input_by_placeholder(page, ["почта", "username", "email", "user"])
-    pwd_loc = find_input_by_placeholder(page, ["пароль", "password"])
+    # 等待 Mitelis 挑战链完成：挑战 JS 通过后会刷新出真实登录页，
+    # 轮询等待输入框出现（最长 90 秒），期间页面可能多次自动刷新
+    email_loc = pwd_loc = None
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        email_loc = find_input_by_placeholder(page, ["почта", "username", "email", "user"])
+        pwd_loc = find_input_by_placeholder(page, ["пароль", "password"])
+        if email_loc and pwd_loc:
+            break
+        page.wait_for_timeout(2000)
 
     # 降级用 CSS 选择器
     if not email_loc:
@@ -611,19 +618,37 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
     logger.info(f"========== 开始处理账号: {email} ==========")
     browser = None
     try:
-        browser = playwright.chromium.launch(
-            headless=headless,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        context = browser.new_context(
-            viewport={"width": 1366, "height": 800},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36",
-            locale="en-US",
-            **({"proxy": {"server": PROXY_SERVER}} if IS_PROXY else {}),
-        )
+        # Mitelis 挑战 JS 会检测自动化痕迹（webdriver 标记、无头特征、UA 与真实浏览器版本不符）：
+        # - 禁用 AutomationControlled blink 特性
+        # - 有头模式运行（CI 中通过 xvfb-run 提供虚拟显示，见 workflow）
+        # - 不写死旧版 UA（Chrome/124 与实际浏览器版本不符是明显的机器人特征），
+        #   默认用 Playwright 随浏览器版本的真实 UA，可用 BROWSER_UA 覆盖
+        launch_kwargs = {
+            "headless": headless,
+            "args": [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        }
+        chrome_channel = os.environ.get("BROWSER_CHANNEL", "").strip()
+        if chrome_channel:
+            launch_kwargs["channel"] = chrome_channel  # 用真实 Chrome 而非 Chromium 构建，更难被识别
+        browser = playwright.chromium.launch(**launch_kwargs)
+
+        context_kwargs = {
+            "viewport": {"width": 1366, "height": 800},
+            "locale": "en-US",
+        }
+        if IS_PROXY:
+            context_kwargs["proxy"] = {"server": PROXY_SERVER}
+        ua_override = os.environ.get("BROWSER_UA", "").strip()
+        if ua_override:
+            context_kwargs["user_agent"] = ua_override
+        context = browser.new_context(**context_kwargs)
         page = context.new_page()
+        # 隐藏 navigator.webdriver 标记（WAF 挑战 JS 最常检测的特征）
+        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
 
         console_lines = []
 
@@ -841,9 +866,13 @@ def main():
         logger.info("🍭 未启用代理，直连访问（若目标站拦截机房 IP，请配置 NODE_LINK）")
 
     with sync_playwright() as pw:
+        # CI 中通过 HEADLESS=false + xvfb-run 以有头模式运行（规避 WAF 无头检测）
+        headless = not args.headed
+        if os.environ.get("HEADLESS", "").strip().lower() in ("0", "false", "no"):
+            headless = False
         for idx, acc in enumerate(accounts, 1):
             logger.info(f"--- 第 {idx}/{len(accounts)} 个账号 ---")
-            res = process_account(acc, pw, headless=not args.headed)
+            res = process_account(acc, pw, headless=headless)
             results.append(res)
             if idx < len(accounts):
                 time.sleep(5)

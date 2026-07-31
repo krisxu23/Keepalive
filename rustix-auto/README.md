@@ -56,8 +56,9 @@ rustix-auto/
 1. workflow 的 `⚙ 设置代理 (sing-box)` 步骤运行 `setup_proxy.sh`（第三方脚本，该步骤仅注入 `NODE_LINK` 一个环境变量）
 2. `NODE_LINK` 非空 → 下载 sing-box → 解析节点 → 本地启动代理（SOCKS5 `127.0.0.1:1080` / HTTP `127.0.0.1:1081`），并把 `IS_PROXY=true`、`PROXY_SERVER=socks5://127.0.0.1:1080` 写入 `GITHUB_ENV`
 3. 同一步骤里还会用 curl 分别以「直连」和「代理」两种路径访问 `my.rustix.me`，输出 HTTP 状态码与耗时对比，一眼判断当前出口是否被拦截
-4. `main.py` 检测到 `IS_PROXY=true` → 浏览器上下文挂载代理，先请求 `api.ip.sb/ip` 打印当前出口 IP；随后对 `my.rustix.me` 做 20 秒可达性预检，不通则快速失败并给出明确原因（不再白等 60s+30s）
-5. 之后所有页面访问都经 sing-box → 你的节点 → `my.rustix.me`，目标站看到的出口 IP 为节点 IP
+4. `main.py` 以**有头模式 + 真实 Chrome**（xvfb 虚拟显示）启动浏览器，禁用 `AutomationControlled` 特性并隐藏 `navigator.webdriver` 标记——Mitelis 的多层 JS 挑战会检测无头/自动化痕迹，检测到就拖死页面（表现为 `domcontentloaded` 永不触发）
+5. 登录页加载改用 `wait_until="commit"` + 最长 90 秒轮询等待登录表单（挑战页会多次自动刷新，等 `domcontentloaded` 会被打断）
+6. 所有页面访问都经 sing-box → 你的节点 → `my.rustix.me`，目标站看到的出口 IP 为节点 IP
 
 **如何确认生效**：运行日志出现：
 
@@ -177,4 +178,4 @@ IS_PROXY=true PROXY_SERVER=socks5://127.0.0.1:1080 python main.py
 - 调试截图 `debug_*.png` 仅在找不到关键元素时生成，随运行日志一起上传 artifact（保留 7 天）。
 - 若站点页面结构更新导致选择器失效，可在 `find_button_by_text` / `find_first_visible` 中补充选择器。
 - `setup_proxy.sh` 来自第三方域名，该步骤仅接收 `NODE_LINK` 环境变量，其他 Secrets 不会暴露给它；sing-box 本体从 GitHub 官方 releases 下载。
-- 若配置节点后仍失败：先看 workflow 里 `⚙ 设置代理` 步骤的「直连 / 代理」对比测试输出——若代理路径超时/失败，说明节点出口 IP 被 Mitelis 拦截（机场节点多为机房 IP），需换**住宅/家宽 IP** 的节点；若代理测试正常但脚本仍失败，再检查日志中 `📍 当前出口 IP` 与 `站点预检` 输出。
+- 若配置节点后仍失败：先看 workflow 里 `⚙ 设置代理` 步骤的「直连 / 代理」对比测试输出——若代理路径超时/失败，说明节点出口 IP 被 Mitelis 拦截（机场节点多为机房 IP），需换**住宅/家宽 IP** 的节点；若代理测试正常（HTTP 403/200 都算可达）但脚本仍「页面加载超时」，说明是 Mitelis 挑战 JS 检测到自动化痕迹，请确认运行步骤使用了 `xvfb-run` + `HEADLESS=false` + `BROWSER_CHANNEL=chrome`（有头模式 + 真实 Chrome），并检查日志中 `📍 当前出口 IP` 与 `站点预检` 输出。
