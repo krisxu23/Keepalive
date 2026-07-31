@@ -197,6 +197,14 @@ def open_login_page(sb) -> bool:
 def login_with_password(sb, email: str, password: str) -> bool:
     if not open_login_page(sb):
         logger.error("60s 内未出现登录表单（挑战未通过或站点不可达）")
+        # 诊断：记录页面片段，区分「卡在挑战页」与「完全空白/拖死」
+        try:
+            src = sb.get_page_source()
+            url = sb.get_current_url()
+            logger.info(f"诊断 | URL: {url} | 页面大小: {len(src)} | 片段: {src[:200]!r}")
+            logger.info(f"诊断 | 挑战标记: {[m for m in ('mit_ck', 'FsGtA7wj4k6YkizM', 'just a moment') if m in src]}")
+        except Exception:
+            pass
         try:
             sb.save_screenshot("debug_login.png")
         except Exception:
@@ -354,6 +362,16 @@ def process_account(account: dict, headless: bool = False) -> dict:
 
     with SB(**sb_kwargs) as sb:
         try:
+            # 诊断：代理模式下探测浏览器实际出口 IP，
+            # 用于区分「代理未生效(直连机房IP)」和「代理生效但节点IP被拉黑」
+            if IS_PROXY:
+                try:
+                    sb.open("https://api.ip.sb/ip")
+                    ip = sb.get_text("body").strip()
+                    logger.info(f"🌐 浏览器实际出口 IP: {ip}")
+                except Exception as e:
+                    logger.warning(f"浏览器出口 IP 探测失败: {e}")
+
             logger.info("尝试账号密码登录（第一选择）...")
             login_ok = login_with_password(sb, email, password)
             if not login_ok:
